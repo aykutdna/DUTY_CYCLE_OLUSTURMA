@@ -1,0 +1,313 @@
+import os
+import re
+import glob
+import numpy as np
+import pandas as pd
+
+# =========================
+# AYARLAR
+# =========================
+EXCEL_PATH = r"D:\KISISEL\DOKTORA\4_TIK\9000\MARKOV_ZINCIRI_SIRALAMASI.xlsx"
+TASKS_DIR  = r"D:\KISISEL\DOKTORA\4_TIK\9000"
+OUT_PATH   = os.path.join(TASKS_DIR, "DUTY_CYCLE_FINAL.csv")
+
+# Transition (süreklilik köprüsü) ayarları:
+MAX_TRANSITION_SEC  = 0.5      # absolute cap
+MAX_TRANSITION_FRAC = 0.001    # task duration cap (0.1%)
+
+# Zaman kolonu otomatik tespit için aday isimler:
+TIME_CANDIDATES = [
+    "Time", "TIME", "Timestamp", "timestamp", "ts", "TS",
+    "time_ms", "Time_ms", "t", "T"
+]
+
+# CSV okuma ayarları:
+CSV_READ_KW = dict(low_memory=False)
+
+# =========================
+# YARDIMCI FONKSİYONLAR
+# =========================
+
+def detect_time_column(df: pd.DataFrame) -> str:
+    cols = list(df.columns)
+
+    # 1) İsimden yakala
+    for c in TIME_CANDIDATES:
+        if c in cols:
+            return c
+
+    # 2) İçerikten tahmin: sayısal ve monoton artan en iyi kolon
+    best = None
+    best_score = -1.0
+
+    for c in cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.isna().mean() > 0.3:
+            continue
+
+        dif = s.diff()
+        mono = (dif >= 0).mean()
+        span = float(s.max() - s.min())
+        score = mono * 2.0 + (np.log1p(max(span, 0.0)) / 10.0)
+
+        if score > best_score:
+            best_score = score
+            best = c
+
+    if best is None:
+        raise ValueError("Zaman kolonu tespit edilemedi. CSV'lerde bir zaman kolonu olmalı.")
+
+    return best
+
+def robust_read_csv(path: str) -> pd.DataFrame:
+    # delimiter otomatik yakalama (virgül/noktalı virgül/tab)
+    try:
+        df = pd.read_csv(path, **CSV_READ_KW)
+        if df.shape[1] == 1:
+            df = pd.read_csv(path, sep=";", **CSV_READ_KW)
+        if df.shape[1] == 1:
+            df = pd.read_csv(path, sep="\t", **CSV_READ_KW)
+        return df
+    except Exception as e:
+        raise RuntimeError(f"CSV okunamadı: {path}\nHata: {e}")
+
+def find_task_file(task_name: str, root_dir: str) -> str:
+    """
+    task_name'e karşılık gelen temsilci görev CSV'sini bulur.
+    Önce doğrudan eşleşme, sonra kısmi eşleşme dener.
+    """
+    patterns = [
+        os.path.join(root_dir, f"{task_name}.csv"),
+        os.path.join(root_dir, f"{task_name}*.csv"),
+        os.path.join(root_dir, "**", f"{task_name}.csv"),
+        os.path.join(root_dir, "**", f"{task_name}*.csv"),
+    ]
+
+    hits = []
+    for p in patterns:
+        hits.extend(glob.glob(p, recursive=True))
+
+    hits = [h for h in hits if h.lower().endswith(".csv")]
+
+    if not hits:
+        loose = glob.glob(os.path.join(root_dir, "**", "*.csv"), recursive=True)
+        hits = [h for h in loose if task_name.lower() in os.path.basename(h).lower()]
+
+    if not hits:
+        raise FileNotFoundError(f"Temsilci görev CSV bulunamadı: {task_name} (klasör: {root_dir})")
+
+    hits_sorted = sorted(hits, key=lambda x: (len(os.path.basename(x)), len(x)))
+    return hits_sorted[0]
+
+def median_dt(t: pd.Series) -> float:
+    """t aynı birimdeyken median örnek aralığı (dt) döndürür."""
+    t_num = pd.to_numeric(t, errors="coerce").dropna()
+    if len(t_num) < 5:
+        return 1.0
+    dif = t_num.diff().dropna()
+    dif = dif[dif > 0]
+    if len(dif) == 0:
+        return 1.0
+    return float(dif.median())
+
+def guess_time_unit_scale_to_sec(t: pd.Series) -> float:
+    """
+    Saniyeye çevirme ölçeği:
+    - time ms ise 0.001
+    - time s ise 1.0
+    Heuristik: span büyükse ms olma ihtimali yüksek.
+    """
+    t_num = pd.to_numeric(t, errors="coerce").dropna()
+    if len(t_num) < 5:
+        return 1.0
+    span = float(t_num.max() - t_num.min())
+    if span > 100000:
+        return 0.001
+    return 1.0
+
+def make_transition_rows(last_row: pd.Series, first_row: pd.Series, cols, n_steps: int) -> pd.DataFrame:
+    """
+    last->first arasında n_steps satırlık lineer geçiş üretir.
+    Sadece sayısal değerlere interpolate uygular, diğerlerini last değerinde tutar.
+    """
+    data = {}
+    for c in cols:
+        a = last_row.get(c, np.nan)
+        b = first_row.get(c, np.nan)
+
+        aa = pd.to_numeric(a, errors="coerce")
+        bb = pd.to_numeric(b, errors="coerce")
+
+        if (not np.isnan(aa)) and (not np.isnan(bb)):
+            alphas = np.linspace(0, 1, n_steps + 2)[1:-1]  # uçlar hariç
+            data[c] = (aa * (1 - alphas) + bb * alphas).tolist()
+        else:
+            data[c] = [a] * n_steps
+
+    return pd.DataFrame(data)
+
+def read_markov_order(excel_path: str) -> tuple[list, str, str]:
+    xls = pd.ExcelFile(excel_path)
+    if len(xls.sheet_names) < 2:
+        raise ValueError("Excel dosyasında 2. sekme yok.")
+    sheet2 = xls.sheet_names[1]
+
+    df = pd.read_excel(excel_path, sheet_name=sheet2)
+
+    candidate_cols = [
+        c for c in df.columns
+        if re.search(r"(görev|gorev|task|name|isim|scenario|senaryo)", str(c), re.I)
+    ]
+    col = candidate_cols[0] if candidate_cols else df.columns[0]
+
+    order = df[col].dropna().astype(str).tolist()
+    order = [o.strip() for o in order if o.strip() != ""]
+    return order, sheet2, col
+
+# =========================
+# ANA AKIŞ
+# =========================
+def main():
+    order, sheet2, order_col = read_markov_order(EXCEL_PATH)
+    if not order:
+        raise ValueError("Markov sıralaması boş görünüyor (2. sekmede görev listesi yok).")
+
+    print(f"[OK] Excel 2. sekme: '{sheet2}', sıra kolonu: '{order_col}', görev sayısı: {len(order)}")
+
+    # Temsilci görev dosyalarını bul
+    task_paths = []
+    for task in order:
+        task_paths.append(find_task_file(task, TASKS_DIR))
+
+    print("[OK] Temsilci görev dosyaları bulundu:")
+    for t, p in zip(order, task_paths):
+        print(f"  - {t} -> {p}")
+
+    dfs = []
+    time_cols = []
+    scales = []
+
+    # Oku + time kolonu tespit + her görevin time'ını 0'dan başlat
+    for p in task_paths:
+        df = robust_read_csv(p)
+
+        tcol = detect_time_column(df)
+        t_raw = pd.to_numeric(df[tcol], errors="coerce")
+
+        if t_raw.isna().all():
+            raise ValueError(f"{p} içinde zaman kolonu sayısala çevrilemedi: {tcol}")
+
+        scale = guess_time_unit_scale_to_sec(t_raw)
+
+        t0 = float(t_raw.dropna().iloc[0])
+        df[tcol] = pd.to_numeric(df[tcol], errors="coerce") - t0
+
+        dfs.append(df)
+        time_cols.append(tcol)
+        scales.append(scale)
+
+    # Kolon birliği
+    all_cols = []
+    for df in dfs:
+        all_cols.extend(list(df.columns))
+
+    seen = set()
+    union_cols = []
+    for c in all_cols:
+        if c not in seen:
+            seen.add(c)
+            union_cols.append(c)
+
+    # Master time kolonu: ilk df'in time kolonu
+    master_tcol = time_cols[0]
+
+    # Diğer df'lerdeki time kolonlarını master_tcol adına eşle
+    for i in range(len(dfs)):
+        if time_cols[i] != master_tcol:
+            dfs[i] = dfs[i].rename(columns={time_cols[i]: master_tcol})
+
+    # Birleştirme
+    out_parts = []
+    cumulative_time = 0.0
+    added_transition_total = 0.0
+
+    # master birimin saniye ölçeği (0.001 ise ms, 1.0 ise s)
+    scale0 = scales[0]
+
+    for i, df in enumerate(dfs):
+        df = df.reindex(columns=union_cols)
+
+        t = pd.to_numeric(df[master_tcol], errors="coerce").ffill().fillna(0)
+        dt = median_dt(t)
+        if dt <= 0:
+            dt = 1.0
+
+        seg_dur = float(t.iloc[-1] - t.iloc[0])
+        if seg_dur < 0:
+            seg_dur = float(t.max() - t.min())
+
+        # bu segmenti mevcut sona kaydır
+        df[master_tcol] = t + cumulative_time
+
+        if i == 0:
+            out_parts.append(df)
+            # dt boşluğu EKLEME (toplam süre şişmesin)
+            cumulative_time = float(df[master_tcol].iloc[-1])
+            continue
+
+        # Transition süresi (çok küçük, %1 sınırının çok altında)
+        max_transition_in_master_units = MAX_TRANSITION_SEC / scale0
+        cap_by_frac = seg_dur * MAX_TRANSITION_FRAC
+        transition_len = min(max_transition_in_master_units, cap_by_frac)
+
+        n_steps = int(np.floor(transition_len / dt))
+
+        if n_steps >= 2:
+            prev_last = out_parts[-1].iloc[-1]
+            cur_first = df.iloc[0]
+
+            last_time = float(prev_last[master_tcol])
+            trans_times = [last_time + k * dt for k in range(1, n_steps + 1)]
+
+            trans_df = make_transition_rows(prev_last, cur_first, union_cols, n_steps)
+            trans_df[master_tcol] = trans_times
+
+            out_parts.append(trans_df)
+            added_transition_total += float(n_steps * dt)
+
+            # df'i transition sonundan devam ettir (burada dt kadar ileriden başlatmak mantıklı)
+            shift_needed = (float(trans_df[master_tcol].iloc[-1] + dt) - float(df[master_tcol].iloc[0]))
+            df[master_tcol] = df[master_tcol] + shift_needed
+
+        out_parts.append(df)
+
+        t2 = pd.to_numeric(df[master_tcol], errors="coerce").ffill().fillna(0)
+        # dt boşluğu EKLEME
+        cumulative_time = float(t2.iloc[-1])
+
+    duty = pd.concat(out_parts, ignore_index=True)
+
+    # Süre kontrol raporu (yaklaşık)
+    orig_total = 0.0
+    for df in dfs:
+        tt = pd.to_numeric(df[master_tcol], errors="coerce").ffill().fillna(0)
+        orig_total += float(tt.max() - tt.min())
+
+    final_span = float(
+        pd.to_numeric(duty[master_tcol], errors="coerce").max()
+        - pd.to_numeric(duty[master_tcol], errors="coerce").min()
+    )
+
+    pct_added = (added_transition_total / orig_total) * 100.0 if orig_total > 0 else 0.0
+
+    print(f"[INFO] Transition eklenen toplam süre (master time birimi): {added_transition_total:.3f}")
+    print(f"[INFO] Orijinal toplam süre (yaklaşık): {orig_total:.3f}")
+    print(f"[INFO] Final span: {final_span:.3f}")
+    print(f"[INFO] Süre artışı ~ %{pct_added:.4f} (hedef: %1'den küçük)")
+
+    duty.to_csv(OUT_PATH, index=False),
+    
+    print(f"[OK] Oluşturuldu: {OUT_PATH}")
+
+if __name__ == "__main__":
+    main()
