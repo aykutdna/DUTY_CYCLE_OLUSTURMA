@@ -1,0 +1,388 @@
+import os
+import random
+from dataclasses import dataclass
+from typing import Dict, List
+
+import pandas as pd
+
+
+# =============================================================================
+# AMAÇ / ÖZET
+# -----------------------------------------------------------------------------
+# Bu script, GA (Genetik Algoritma) tarafından belirlenmiş SABİT tekrar adetlerine
+# (COUNTS_FIXED) %100 sadık kalarak bir görev sıralaması (duty cycle ordering)
+# üretir.
+#
+# Temel fikir:
+# - GA → "Hangi görev kaç kez tekrar edecek?" sorusunu çözer (adetler sabittir).
+# - Markov Zinciri → "Bu görevler hangi sırayla dizilmeli?" sorusunu çözer.
+#
+# Buradaki Markov zinciri "görev = durum (state)" olacak şekilde KURULUR.
+# Yani 6 görev varsa, 6-state Markov zinciri vardır.
+#
+# Ayrıca kullanıcı kısıtı:
+# - Başlangıç görevİ TAŞIMA grubundan seçilecek,
+# - Son görevİ de TAŞIMA grubundan seçilecek.
+#
+# Önemli:
+# - Kodu çalıştırırken Excel dosyası açıksa Windows dosyayı kilitlediği için
+#   PermissionError alırsın. Dosyayı kapat ya da isim değiştir.
+# =============================================================================
+
+
+# =========================
+# 1) AYARLAR
+# =========================
+BASE_DIR = r"D:\KISISEL\DOKTORA\4_TIK\9000"
+
+# Grup düzeyinde geçiş kuralı (senin tanımın):
+# "Taşıma'dan sonra Pulluk gelme olasılığı %80"
+P_TRANSPORT_TO_PLOW = 0.80     # TAŞIMA grubundan → PULLUK grubuna geçiş
+P_PLOW_TO_TRANSPORT = 0.80     # PULLUK grubundan → TAŞIMA grubuna geçiş (varsayılan)
+
+# Rastgelelik için sabit tohum (aynı sonuçları tekrar üretmek için)
+SEED = 42
+
+# Tek çıktı Excel dosyası
+OUT_XLSX = os.path.join(BASE_DIR, "MARKOV_ZINCIRI_SIRALAMASI.xlsx")
+
+
+# =========================
+# 2) TEMSİLCİ GÖREVLER (SÜRE/AGIRLIK PARAMETRELERİ)
+# =========================
+# tek_h: Bir görevin tek çalışmasının süresi (duty cycle adım süresi gibi düşün).
+# katki_sure_h: Bu temsilci görevin veri kümesindeki toplam katkısı (oran/önem ağırlığı).
+#
+# Not: Bu scriptte 'katki_sure_h' iki yerde işe yarar:
+# 1) Markov geçiş MATRİSİNİN, grup içi dağıtımını belirlemek için (matrise gömülü ağırlık),
+# 2) (İstersen genişletilebilir) görev içi/alt seçim modellerinde ağırlık olarak.
+PLOW_TASKS = {
+    "9000_TARLA_PULLUK_4": {"tek_h": 1.8390, "katki_sure_h": 7.3560},
+    "9000_TARLA_PULLUK_5": {"tek_h": 0.6320, "katki_sure_h": 0.6320},
+}
+
+TRANSPORT_TASKS = {
+    "9000_TASIMA_4":  {"tek_h": 0.2890, "katki_sure_h": 0.8670},
+    "9000_TASIMA_13": {"tek_h": 0.0940, "katki_sure_h": 0.0940},
+    "9000_TASIMA_12": {"tek_h": 0.1310, "katki_sure_h": 0.2620},
+    "9000_TASIMA_1":  {"tek_h": 0.3890, "katki_sure_h": 0.7780},
+}
+
+# Tüm görevleri tek sözlükte topluyoruz (süreye tek yerden erişmek için)
+ALL_TASKS = {**TRANSPORT_TASKS, **PLOW_TASKS}
+
+
+# =========================
+# 3) GA'DAN GELEN SABİT TEKRAR ADET KISITI
+# =========================
+# Bu adetlere %100 sadık kalacağız:
+# - Kod görevleri seçerken remaining (kalan adet) 0 olan görevi ASLA seçmez.
+# - Bu sayede duty cycle sıralaması GA kompozisyonunu bozmaz.
+COUNTS_FIXED = {
+    # Pulluk adetleri
+    "9000_TARLA_PULLUK_4": 4,
+    "9000_TARLA_PULLUK_5": 1,
+
+    # Taşıma adetleri
+    "9000_TASIMA_4": 3,
+    "9000_TASIMA_13": 1,
+    "9000_TASIMA_12": 2,
+    "9000_TASIMA_1": 2,
+}
+
+
+# =========================
+# 4) MARKOV MATRİSİ (GÖREV=STATE) OLUŞTURMA
+# =========================
+def normalize(weights: List[float]) -> List[float]:
+    """
+    Verilen ağırlık listesini toplamı 1 olacak şekilde normalize eder.
+    Toplam 0 ise (teorik olarak olmamalı) eşit dağıtır.
+    """
+    s = sum(weights)
+    if s <= 0:
+        return [1.0 / len(weights)] * len(weights)
+    return [w / s for w in weights]
+
+
+def build_task_level_transition_matrix() -> pd.DataFrame:
+    """
+    6-state (görev sayısı kadar state) Markov geçiş matrisi üretir.
+
+    Mantık:
+    - Her "TAŞIMA" görevinden çıkışta:
+        * Toplam P_TRANSPORT_TO_PLOW olasılık PULLUK görevlerine dağılır,
+        * Kalan (1 - P_TRANSPORT_TO_PLOW) olasılık TAŞIMA görevlerine dağılır.
+    - Her "PULLUK" görevinden çıkışta:
+        * Toplam P_PLOW_TO_TRANSPORT olasılık TAŞIMA görevlerine dağılır,
+        * Kalan (1 - P_PLOW_TO_TRANSPORT) olasılık PULLUK görevlerine dağılır.
+
+    Grup içi dağıtım (ör. Pulluk grubunda 2 görev var):
+    - Olasılık, görevlerin katki_sure_h oranlarına göre dağıtılır.
+    Böylece 'katkısı büyük' temsilci görevler Markov geçişlerinde daha baskın olur.
+    """
+    plow_keys = list(PLOW_TASKS.keys())
+    trans_keys = list(TRANSPORT_TASKS.keys())
+    states = trans_keys + plow_keys
+
+    # Grup içi ağırlıklar (katki_sure_h ile)
+    plow_w = normalize([PLOW_TASKS[k]["katki_sure_h"] for k in plow_keys])
+    trans_w = normalize([TRANSPORT_TASKS[k]["katki_sure_h"] for k in trans_keys])
+
+    T = pd.DataFrame(0.0, index=states, columns=states)
+
+    # TAŞIMA satırları (from transport tasks)
+    for s in trans_keys:
+        # taşıma→taşıma toplam olasılık
+        p_to_trans = 1.0 - P_TRANSPORT_TO_PLOW
+        for k, w in zip(trans_keys, trans_w):
+            T.loc[s, k] = p_to_trans * w
+
+        # taşıma→pulluk toplam olasılık
+        for k, w in zip(plow_keys, plow_w):
+            T.loc[s, k] = P_TRANSPORT_TO_PLOW * w
+
+    # PULLUK satırları (from plow tasks)
+    for s in plow_keys:
+        # pulluk→taşıma toplam olasılık
+        for k, w in zip(trans_keys, trans_w):
+            T.loc[s, k] = P_PLOW_TO_TRANSPORT * w
+
+        # pulluk→pulluk toplam olasılık
+        p_to_plow = 1.0 - P_PLOW_TO_TRANSPORT
+        for k, w in zip(plow_keys, plow_w):
+            T.loc[s, k] = p_to_plow * w
+
+    # Sayısal hataları gidermek için satır toplamını 1'e normalize et
+    T = T.div(T.sum(axis=1), axis=0)
+    return T
+
+
+def task_group(task_id: str) -> str:
+    """Görev taşıma sözlüğünde ise TAŞIMA, değilse PULLUK döner."""
+    return "TASIMA" if task_id in TRANSPORT_TASKS else "PULLUK"
+
+
+def task_duration(task_id: str) -> float:
+    """Görevin tek çalışmasının süresini (saat) döner."""
+    return float(ALL_TASKS[task_id]["tek_h"])
+
+
+@dataclass
+class Step:
+    """
+    Tek bir duty cycle adımını temsil eder.
+    - adim: sıra numarası
+    - gorev: seçilen görev adı
+    - grup: TAŞIMA/PULLUK
+    - sure_h: bu adımın süresi (tek_h)
+    - kume_sure_h: kümülatif süre
+    - kalan_adet_sonra: bu görev seçildikten sonra elde kalan tekrar adedi
+    """
+    adim: int
+    gorev: str
+    grup: str
+    sure_h: float
+    kume_sure_h: float
+    kalan_adet_sonra: int
+
+
+# =========================
+# 5) BAŞLANGIÇ/BİTİŞ TAŞIMA KISITI İLE SIRALAMA ÜRETİMİ
+# =========================
+def pick_start_transport(remaining: Dict[str, int]) -> str:
+    """
+    Başlangıç görevi mutlaka TAŞIMA olsun.
+    Başlangıç için, kalan adedi en yüksek olan taşıma görevini seçiyoruz.
+    (İstersen burada farklı strateji uygulanabilir.)
+    """
+    trans_avail = [k for k in TRANSPORT_TASKS.keys() if remaining.get(k, 0) > 0]
+    if not trans_avail:
+        raise ValueError("Başlangıç için hiç TAŞIMA görevi yok (transport count = 0).")
+    return max(trans_avail, key=lambda k: remaining[k])
+
+
+def pick_end_transport(remaining: Dict[str, int]) -> str:
+    """
+    Son görev mutlaka TAŞIMA olsun.
+    Burada da kalan adedi en yüksek taşıma görevini seçip rezerve ediyoruz.
+    """
+    trans_avail = [k for k in TRANSPORT_TASKS.keys() if remaining.get(k, 0) > 0]
+    if not trans_avail:
+        raise ValueError("Bitiş için hiç TAŞIMA görevi yok (transport count = 0).")
+    return max(trans_avail, key=lambda k: remaining[k])
+
+
+def generate_sequence_fixed_counts_start_end_transport(
+    T: pd.DataFrame,
+    counts_fixed: Dict[str, int],
+    rng: random.Random,
+) -> pd.DataFrame:
+    """
+    GA adetlerine %100 sadık kalarak ve
+    - ilk adım TAŞIMA,
+    - son adım TAŞIMA
+    olacak şekilde görev sıralaması üretir.
+
+    Yöntem:
+    1) Bir TAŞIMA görevini başlangıç seç ve remaining'den düş.
+    2) Bir TAŞIMA görevini bitiş için rezerve et ve remaining'den düş.
+    3) Ortadaki adımlar için her adımda:
+       - Sadece remaining > 0 olan adaylar arasından seç.
+       - Ağırlığı: P(current->candidate) * remaining[candidate] al.
+         Bu çarpan iki şeyi aynı anda sağlar:
+         a) Markov geçiş olasılıklarına uyum,
+         b) Kalan adetleri tüketmeye zorlayarak sıkışmayı azaltma.
+    4) En sona rezerve ettiğimiz taşıma görevini koy.
+    5) Kalan adetlerin hepsi 0 mı kontrol et.
+    """
+    remaining = counts_fixed.copy()
+    total_steps = sum(remaining.values())
+
+    if total_steps < 2:
+        raise ValueError("Başlangıç ve bitiş koşulu için toplam adım sayısı en az 2 olmalı.")
+
+    # Başlangıç + bitiş için toplam taşıma adedi en az 2 olmalı
+    total_transport = sum(remaining.get(k, 0) for k in TRANSPORT_TASKS.keys())
+    if total_transport < 2:
+        raise ValueError(
+            f"Başlangıç ve bitişin TAŞIMA olması için toplam TAŞIMA adedi en az 2 olmalı. "
+            f"(Şu an: {total_transport})"
+        )
+
+    # 1) Başlangıcı seç (TAŞIMA)
+    start_task = pick_start_transport(remaining)
+    remaining[start_task] -= 1
+
+    # 2) Bitişi seç (TAŞIMA) ve rezerve et
+    end_task = pick_end_transport(remaining)
+    remaining[end_task] -= 1
+
+    middle_steps = total_steps - 2  # ortada kaç adım kaldı
+
+    rows: List[Step] = []
+    cum_h = 0.0
+
+    # Başlangıç adımı yaz
+    cum_h += task_duration(start_task)
+    rows.append(
+        Step(
+            adim=1,
+            gorev=start_task,
+            grup=task_group(start_task),
+            sure_h=task_duration(start_task),
+            kume_sure_h=cum_h,
+            kalan_adet_sonra=remaining[start_task],
+        )
+    )
+
+    current = start_task
+
+    # 3) Orta adımlar (kısıtlı Markov örnekleme)
+    for i in range(2, 2 + middle_steps):
+        candidates = [k for k, v in remaining.items() if v > 0]
+        if not candidates:
+            raise RuntimeError("Orta adımlarda aday kalmadı (mantıksal hata).")
+
+        weights = []
+        for nxt in candidates:
+            # Markov olasılığı
+            p = float(T.loc[current, nxt]) if (current in T.index and nxt in T.columns) else 0.0
+            # Kalan adet çarpanı: bitmesi gereken görevlerin seçilmesini teşvik eder
+            weights.append(p * remaining[nxt])
+
+        # Olasılıklar 0'a çökerse (çok nadir), kalanlardan rastgele seç
+        if sum(weights) <= 0:
+            nxt = rng.choice(candidates)
+        else:
+            nxt = rng.choices(candidates, weights=weights, k=1)[0]
+
+        # seçilen görevi tüket
+        remaining[nxt] -= 1
+        cum_h += task_duration(nxt)
+
+        rows.append(
+            Step(
+                adim=i,
+                gorev=nxt,
+                grup=task_group(nxt),
+                sure_h=task_duration(nxt),
+                kume_sure_h=cum_h,
+                kalan_adet_sonra=remaining[nxt],
+            )
+        )
+
+        current = nxt
+
+    # 4) Son adım: rezerve edilen taşıma görevi
+    cum_h += task_duration(end_task)
+    rows.append(
+        Step(
+            adim=total_steps,
+            gorev=end_task,
+            grup=task_group(end_task),
+            sure_h=task_duration(end_task),
+            kume_sure_h=cum_h,
+            kalan_adet_sonra=remaining[end_task],  # teorik olarak 0 olmalı
+        )
+    )
+
+    # 5) Kalan adet kontrolü (hepsi 0 olmalı)
+    leftovers = {k: v for k, v in remaining.items() if v != 0}
+    if leftovers:
+        raise RuntimeError(f"Adetler tam tüketilmedi! Kalanlar: {leftovers}")
+
+    return pd.DataFrame([r.__dict__ for r in rows])
+
+
+# =========================
+# 6) ÇALIŞTIR & KAYDET
+# =========================
+def main():
+    rng = random.Random(SEED)
+
+    # Görev seviyesinde Markov geçiş matrisi
+    T = build_task_level_transition_matrix()
+
+    # Sabit adet + başlangıç/son taşıma kısıtları ile sıralama üret
+    df = generate_sequence_fixed_counts_start_end_transport(T, COUNTS_FIXED, rng)
+
+    # Excel dosyasını yaz (dosya açıksa PermissionError alırsın)
+    with pd.ExcelWriter(OUT_XLSX, engine="xlsxwriter") as writer:
+        T.to_excel(writer, sheet_name="MARKOV_MATRIX_TASK")
+        df.to_excel(writer, sheet_name="SIRALAMA", index=False)
+
+        # Özet sayfası: her grubun adım sayısı ve toplam süreleri
+        ozet = df.groupby("grup")["sure_h"].agg(["count", "sum"]).reset_index()
+        ozet.columns = ["grup", "adim_sayisi", "toplam_sure_h"]
+        ozet.to_excel(writer, sheet_name="OZET", index=False)
+
+    # Terminal çıktısı: kontrol amaçlı tüm sıralama
+    print("\n========== KISITLI TAM MARKOV (START/END TAŞIMA) ==========\n")
+    print("Markov Geçiş Matrisi (görev seviyesinde):")
+    print(T.round(4), "\n")
+
+    print("GA Sabit Adetler (COUNTS_FIXED):")
+    for k, v in COUNTS_FIXED.items():
+        print(f"  {k:<22} = {v}")
+    print()
+
+    print(f"Toplam adım sayısı: {len(df)}")
+    print(f"Başlangıç görevi   : {df.iloc[0]['gorev']}  ({df.iloc[0]['grup']})")
+    print(f"Bitiş görevi       : {df.iloc[-1]['gorev']} ({df.iloc[-1]['grup']})")
+    print(f"Toplam süre        : {df['sure_h'].sum():.3f} h\n")
+
+    ozet2 = df.groupby("grup")["sure_h"].sum()
+    total_h = float(df["sure_h"].sum())
+    for g in ozet2.index:
+        print(f"{g:<8} toplam = {ozet2[g]:.3f} h   (%{100*ozet2[g]/total_h:.1f})")
+
+    print("\n--- TÜM GÖREV SIRALAMASI ---")
+    print(df.to_string(index=False))
+
+    print("\nExcel çıktısı oluşturuldu:")
+    print(OUT_XLSX)
+
+
+if __name__ == "__main__":
+    main()
