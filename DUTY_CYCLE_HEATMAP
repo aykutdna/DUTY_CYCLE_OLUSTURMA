@@ -1,0 +1,222 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+
+# =========================================================
+# DOSYA + AYARLAR
+# =========================================================
+CSV_PATH = r"D:\KISISEL\DOKTORA\4_TIK\9000\DUTY_CYCLE_FINAL.csv"
+
+# Kolonlar (senin dosyana göre)
+COL_TIME = "Time"
+COL_RPM = "EngineSpeed"
+COL_TQ_PCT = "ActualEngine_PercTorque"
+
+# Motor parametreleri
+MAX_TORQUE_NM = 500.0          # %100 tork = 500 Nm varsayımı
+MAX_ENGINE_POWER_KW = 100.0    # güç grafiği üst limit (istenen)
+
+# Çözünürlük (bin sayısı)
+RPM_BINS = 70
+TQ_BINS = 55
+PWR_BINS = 55
+
+# Görsel ayarlar
+COLORMAP = "turbo"
+USE_LOG_SCALE = True
+DPI = 450
+
+# Çıktılar
+OUT_COMBINED = "heatmap_torque_and_power_side_by_side_100kW.png"
+OUT_TQ = "01_heatmap_rpm_torqueNm_time.png"
+OUT_PWR = "02_heatmap_rpm_powerkW_time_100kW.png"
+
+
+# =========================================================
+# YARDIMCI FONKSİYONLAR
+# =========================================================
+def infer_dt_seconds_from_time(time_series: pd.Series) -> np.ndarray:
+    """
+    Time kolonu epoch(ms) veya saniye olabilir.
+    dt = ardışık farklar (saniye).
+    """
+    t = pd.to_numeric(time_series, errors="coerce").to_numpy()
+    dt = np.diff(t, prepend=np.nan)
+
+    med = np.nanmedian(dt)
+    if not np.isfinite(med) or med <= 0:
+        med = 100.0
+
+    # med > 10 ise büyük olasılıkla ms -> s
+    if med > 10:
+        dt = dt / 1000.0
+        med = med / 1000.0
+
+    dt[0] = med
+    dt = np.where(np.isfinite(dt) & (dt > 0), dt, med)
+
+    # uç değerleri kırp (sensör boşlukları vb.)
+    hi = np.nanpercentile(dt, 99)
+    if np.isfinite(hi) and hi > 0:
+        dt = np.clip(dt, 0, hi)
+
+    return dt
+
+
+def vmin_vmax_for_log(Z: np.ndarray):
+    """
+    LogNorm için vmin/vmax seçimi:
+    düşük yoğunluklar kaybolmasın diye alt %5'ten başlat.
+    """
+    Zm = np.ma.masked_where(Z <= 0, Z)
+    if Zm.count() == 0:
+        return 1e-2, 1.0
+    data = Zm.compressed()
+    vmin = max(1e-2, float(np.nanpercentile(data, 5)))
+    vmax = float(np.nanmax(data))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+    if vmin >= vmax:
+        vmin = max(1e-3, vmax / 100.0)
+    return vmin, vmax
+
+
+def plot_single_heatmap(ax, x_edges, y_edges, Z, title, xlabel, ylabel):
+    Zm = np.ma.masked_where(Z <= 0, Z)
+    vmin, vmax = vmin_vmax_for_log(Z)
+
+    if USE_LOG_SCALE:
+        pcm = ax.pcolormesh(
+            x_edges, y_edges, Zm,
+            cmap=COLORMAP,
+            norm=LogNorm(vmin=vmin, vmax=vmax),
+            shading="auto"
+        )
+    else:
+        pcm = ax.pcolormesh(x_edges, y_edges, Zm, cmap=COLORMAP, shading="auto")
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    return pcm
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    df = pd.read_csv(CSV_PATH)
+
+    # kolon kontrol
+    for c in (COL_TIME, COL_RPM, COL_TQ_PCT):
+        if c not in df.columns:
+            raise ValueError(f"CSV içinde '{c}' yok. Kolonlar: {list(df.columns)}")
+
+    rpm = pd.to_numeric(df[COL_RPM], errors="coerce").to_numpy()
+    tq_pct = pd.to_numeric(df[COL_TQ_PCT], errors="coerce").to_numpy()
+    dt = infer_dt_seconds_from_time(df[COL_TIME])
+
+    # Temizlik
+    mask = np.isfinite(rpm) & np.isfinite(tq_pct) & np.isfinite(dt) & (dt > 0)
+    rpm = rpm[mask]
+    tq_pct = tq_pct[mask]
+    dt = dt[mask]
+
+    # 1) ÖNCE TORK (Nm)
+    tq_nm = (tq_pct / 100.0) * MAX_TORQUE_NM
+    # Fiziksel sınır (istenirse):
+    tq_nm = np.clip(tq_nm, 0.0, MAX_TORQUE_NM)
+
+    # 2) SONRA GÜÇ (kW) HESAPLA
+    pwr_kw = (tq_nm * rpm) / 9549.0
+    # Güç grafiği 0–100 kW olacak şekilde sınırla
+    pwr_kw = np.clip(pwr_kw, 0.0, MAX_ENGINE_POWER_KW)
+
+    # Bilgi (kontrol)
+    print("\n[INFO] Inputs / Ranges:")
+    print(f" - MAX_TORQUE_NM        = {MAX_TORQUE_NM}")
+    print(f" - MAX_ENGINE_POWER_KW  = {MAX_ENGINE_POWER_KW}")
+    print(f" - rows used            = {len(rpm):,}")
+    print(f" - dt median/mean (s)   = {np.median(dt):.4f} / {np.mean(dt):.4f}")
+    print(f" - rpm range (rpm)      = {rpm.min():.1f} .. {rpm.max():.1f}")
+    print(f" - torque range (Nm)    = {tq_nm.min():.1f} .. {tq_nm.max():.1f}")
+    print(f" - power range (kW)     = {pwr_kw.min():.2f} .. {pwr_kw.max():.2f}")
+
+    # Bin edges
+    rpm_edges = np.linspace(rpm.min(), rpm.max(), RPM_BINS + 1)
+    tq_edges = np.linspace(0.0, MAX_TORQUE_NM, TQ_BINS + 1)               # 0..500 Nm
+    pwr_edges = np.linspace(0.0, MAX_ENGINE_POWER_KW, PWR_BINS + 1)       # 0..100 kW
+
+    # Histogram2D: her hücrede toplam süre (s)
+    H_tq, _, _ = np.histogram2d(rpm, tq_nm, bins=[rpm_edges, tq_edges], weights=dt)
+    Z_tq = H_tq.T
+
+    H_pw, _, _ = np.histogram2d(rpm, pwr_kw, bins=[rpm_edges, pwr_edges], weights=dt)
+    Z_pw = H_pw.T
+
+    # -------------------------
+    #  A) TEK PENCEREDE YAN YANA
+    # -------------------------
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    pcm1 = plot_single_heatmap(
+        ax1, rpm_edges, tq_edges, Z_tq,
+        title="Engine speed vs Torque (Nm)",
+        xlabel="Engine speed (ωe) [rpm]",
+        ylabel="Engine torque (Te) [Nm]"
+    )
+    cbar1 = fig.colorbar(pcm1, ax=ax1)
+    cbar1.set_label("Total operating time [s]")
+
+    pcm2 = plot_single_heatmap(
+        ax2, rpm_edges, pwr_edges, Z_pw,
+        title="Engine speed vs Power (kW)  (0–100 kW)",
+        xlabel="Engine speed (ωe) [rpm]",
+        ylabel="Engine power (Pe) [kW]"
+    )
+    cbar2 = fig.colorbar(pcm2, ax=ax2)
+    cbar2.set_label("Total operating time [s]")
+
+    plt.tight_layout()
+    fig.savefig(OUT_COMBINED, dpi=DPI)
+    plt.show()
+    print(f"[OK] Saved combined: {OUT_COMBINED} (dpi={DPI})")
+
+    # -------------------------
+    #  B) AYRI AYRI PNG KAYIT (opsiyonel ama genelde lazım oluyor)
+    # -------------------------
+    # Torque
+    fig1, ax = plt.subplots(figsize=(11, 7))
+    pcm = plot_single_heatmap(
+        ax, rpm_edges, tq_edges, Z_tq,
+        title="Duty Cycle Heatmap: Engine speed vs Torque (Nm)",
+        xlabel="Engine speed (ωe) [rpm]",
+        ylabel="Engine torque (Te) [Nm]"
+    )
+    cb = fig1.colorbar(pcm, ax=ax)
+    cb.set_label("Total operating time [s]")
+    plt.tight_layout()
+    fig1.savefig(OUT_TQ, dpi=DPI)
+    plt.show()
+    print(f"[OK] Saved: {OUT_TQ} (dpi={DPI})")
+
+    # Power (0–100 kW)
+    fig2, ax = plt.subplots(figsize=(11, 7))
+    pcm = plot_single_heatmap(
+        ax, rpm_edges, pwr_edges, Z_pw,
+        title="Duty Cycle Heatmap: Engine speed vs Power (kW) (0–100 kW)",
+        xlabel="Engine speed (ωe) [rpm]",
+        ylabel="Engine power (Pe) [kW]"
+    )
+    cb = fig2.colorbar(pcm, ax=ax)
+    cb.set_label("Total operating time [s]")
+    plt.tight_layout()
+    fig2.savefig(OUT_PWR, dpi=DPI)
+    plt.show()
+    print(f"[OK] Saved: {OUT_PWR} (dpi={DPI})")
+
+
+if __name__ == "__main__":
+    main()
