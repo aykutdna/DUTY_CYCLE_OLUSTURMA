@@ -17,20 +17,19 @@ TASIMA_RATIO = 0.20
 TARGET_PULLUK_H = TOTAL_H * PULLUK_RATIO   # 8.0
 TARGET_TASIMA_H = TOTAL_H * TASIMA_RATIO   # 2.0
 
-# --- tolerans: +-5 dk ---
-TOL_H = 30.0 / 60.0  # 0.083333.. h
-TOL_TOTAL = TOL_H
-TOL_PULLUK = TOL_H
-TOL_TASIMA = TOL_H
+# tolerans (sen geniş tuttun)
+TOL_TOTAL  = 0.50
+TOL_PULLUK = 0.50
+TOL_TASIMA = 0.50
 
-# --- adet sınırları ---
+# adet sınırları
 MIN_COUNT = 1
 MAX_COUNT = 9
 
 # GA parametreleri
-POP_SIZE = 500
+POP_SIZE = 600
 N_GEN = 1500
-ELITE = 50
+ELITE = 60
 TOURNAMENT_K = 4
 MUT_RATE = 0.40
 MUT_STEP = 2
@@ -70,10 +69,10 @@ tasima_hours = np.array([tasima_hours_map[c] for c in TASIMA_TASKS], dtype=float
 print("Pulluk süreleri (h):", dict(zip(PULLUK_TASKS, pulluk_hours)))
 print("Taşıma süreleri (h):", dict(zip(TASIMA_TASKS, tasima_hours)))
 print(f"Hedefler: Total={TOTAL_H}h, Pulluk={TARGET_PULLUK_H}h, Tasima={TARGET_TASIMA_H}h")
-print(f"Tolerans: +-5 dk = {TOL_H:.6f} h | Adet sınırı: [{MIN_COUNT}, {MAX_COUNT}]")
+print(f"Tolerans: Total±{TOL_TOTAL}h, Pulluk±{TOL_PULLUK}h, Tasima±{TOL_TASIMA}h | Adet: [{MIN_COUNT},{MAX_COUNT}]")
 
 # ============================================================
-# GA: KROMOZOM = [x_P1..x_Pn, x_T1..x_Tm] (integer in [1..9])
+# GA
 # ============================================================
 nP = len(PULLUK_TASKS)
 nT = len(TASIMA_TASKS)
@@ -87,12 +86,16 @@ def decode(chrom):
     total_t = pulluk_t + tasima_t
     return p, t, pulluk_t, tasima_t, total_t
 
-def tol_penalty(err, tol, w):
-    # tolerans içi 0, dışı karesel ceza
-    e = abs(err) - tol
-    if e <= 0:
-        return 0.0
-    return w * (e ** 2)
+def penalty_within_and_outside(err, tol, w_out, w_in):
+    """
+    - Tolerans İÇİNDE: küçük lineer ceza -> hedefe yaklaşsın (w_in * |err|)
+    - Tolerans DIŞINDA: sert karesel ceza -> dışarı taşmasın (w_out * (|err|-tol)^2) + içerideki lineer
+    """
+    ae = abs(err)
+    if ae <= tol:
+        return w_in * ae
+    d = ae - tol
+    return (w_in * ae) + (w_out * (d ** 2))
 
 def fitness(chrom):
     p, t, pulluk_t, tasima_t, total_t = decode(chrom)
@@ -102,14 +105,13 @@ def fitness(chrom):
     e_tasima = tasima_t - TARGET_TASIMA_H
 
     f = 0.0
-    # Oranları biraz daha sert, toplamı biraz daha yumuşak yapıyorum.
-    f += tol_penalty(e_total,  TOL_TOTAL,  w=120.0)
-    f += tol_penalty(e_pulluk, TOL_PULLUK, w=250.0)
-    f += tol_penalty(e_tasima, TOL_TASIMA, w=250.0)
+    # İçeride de yakınlaşmayı zorlayacak w_in verdim
+    f += penalty_within_and_outside(e_total,  TOL_TOTAL,  w_out=200.0, w_in=2.0)
+    f += penalty_within_and_outside(e_pulluk, TOL_PULLUK, w_out=300.0, w_in=3.0)
+    f += penalty_within_and_outside(e_tasima, TOL_TASIMA, w_out=300.0, w_in=3.0)
 
-    # Çok küçük bir ek: aşırı uçta sayıları törpülemek için
-    f += 0.001 * float(np.sum(chrom))
-
+    # küçük bir sayım cezası: çok yüksek adetleri engeller
+    f += 0.002 * float(np.sum(chrom))
     return f
 
 def random_chrom():
@@ -121,7 +123,6 @@ def tournament_select(pop):
     return cand[0].copy()
 
 def crossover(a, b):
-    # uniform crossover
     child = a.copy()
     mask = np.random.rand(L) < 0.5
     child[mask] = b[mask]
@@ -131,61 +132,46 @@ def mutate(chrom):
     child = chrom.copy()
     if random.random() > MUT_RATE:
         return child
-
-    k = random.randint(1, L)  # kaç gen mutate olacak
+    k = random.randint(1, L)
     idxs = random.sample(range(L), k)
     for idx in idxs:
         step = random.randint(1, MUT_STEP)
         child[idx] += random.choice([-step, step])
-        if child[idx] < MIN_COUNT:
-            child[idx] = MIN_COUNT
-        if child[idx] > MAX_COUNT:
-            child[idx] = MAX_COUNT
+        if child[idx] < MIN_COUNT: child[idx] = MIN_COUNT
+        if child[idx] > MAX_COUNT: child[idx] = MAX_COUNT
     return child
 
-# ============================================================
-# GA ÇALIŞTIR
-# ============================================================
 population = [random_chrom() for _ in range(POP_SIZE)]
+
 best = None
 best_f = float("inf")
 
 for gen in range(1, N_GEN + 1):
     population.sort(key=fitness)
+    if fitness(population[0]) < best_f:
+        best = population[0].copy()
+        best_f = fitness(best)
 
-    cur = population[0]
-    cur_f = fitness(cur)
-    if cur_f < best_f:
-        best = cur.copy()
-        best_f = cur_f
-
-    # elitizm
     new_pop = [p.copy() for p in population[:ELITE]]
-
     while len(new_pop) < POP_SIZE:
         p1 = tournament_select(population)
         p2 = tournament_select(population)
         child = crossover(p1, p2)
         child = mutate(child)
         new_pop.append(child)
-
     population = new_pop
 
     if gen % 100 == 0 or gen == 1:
         p, t, pulluk_t, tasima_t, total_t = decode(best)
-        print(f"[Gen {gen:4d}] best fitness={best_f:.6f} | "
-              f"Total={total_t:.4f}h, Pulluk={pulluk_t:.4f}h, Tasima={tasima_t:.4f}h")
+        print(f"[Gen {gen:4d}] best fitness={best_f:.6f} | Total={total_t:.4f}h, Pulluk={pulluk_t:.4f}h, Tasima={tasima_t:.4f}h")
 
-# ============================================================
-# SONUÇLARI YAZDIR
-# ============================================================
 p, t, pulluk_t, tasima_t, total_t = decode(best)
 
 print("\n========== EN IYI COZUM ==========")
 print(f"Fitness: {best_f:.9f}")
-print(f"Toplam süre:   {total_t:.4f} h (hedef {TOTAL_H} h, tol ±{TOL_TOTAL:.4f}h)")
-print(f"Pulluk süre:   {pulluk_t:.4f} h (hedef {TARGET_PULLUK_H} h, tol ±{TOL_PULLUK:.4f}h)")
-print(f"Taşıma süre:   {tasima_t:.4f} h (hedef {TARGET_TASIMA_H} h, tol ±{TOL_TASIMA:.4f}h)")
+print(f"Toplam süre: {total_t:.4f}h (hedef {TOTAL_H}h)")
+print(f"Pulluk süre: {pulluk_t:.4f}h (hedef {TARGET_PULLUK_H}h)")
+print(f"Taşıma süre: {tasima_t:.4f}h (hedef {TARGET_TASIMA_H}h)")
 print(f"Oranlar: Pulluk={pulluk_t/total_t*100:.2f}%, Tasima={tasima_t/total_t*100:.2f}%")
 
 print("\n--- Pulluk adetleri ---")
@@ -195,12 +181,3 @@ for name, cnt, dur in zip(PULLUK_TASKS, p, pulluk_hours):
 print("\n--- Taşıma adetleri ---")
 for name, cnt, dur in zip(TASIMA_TASKS, t, tasima_hours):
     print(f"{name:22s}  adet={cnt:2d}  katkı_süre={cnt*dur:.4f}h (tek={dur:.4f}h)")
-
-# Tolerans kontrol uyarısı
-def within(x, target, tol):
-    return abs(x - target) <= tol
-
-print("\n--- Tolerans kontrolü ---")
-print("Total OK  :", within(total_t, TOTAL_H, TOL_TOTAL))
-print("Pulluk OK :", within(pulluk_t, TARGET_PULLUK_H, TOL_PULLUK))
-print("Tasima OK :", within(tasima_t, TARGET_TASIMA_H, TOL_TASIMA))
