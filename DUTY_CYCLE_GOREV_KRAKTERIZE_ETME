@@ -1,11 +1,20 @@
 import os
+import glob
+import re
+from datetime import datetime
 import pandas as pd
 import numpy as np
 
 # ============================================================
-# 0) AYARLAR / PARAMETRELER (Excel'deki "EK PARAMETRELER")
+# 0) AYARLAR / PARAMETRELER
 # ============================================================
-FILE_PATH = r"D:\KISISEL\DOKTORA\4_TIK\9000\9000_TARLA_PULLUK_2.csv"
+BASE_DIR = r"D:\KISISEL\DOKTORA\4_TIK\9000"
+
+# Aynı klasördeki iki grup
+PATTERNS = {
+    "PULLUK": "9000_TARLA_PULLUK_*.csv",
+    "TASIMA": "9000_TASIMA_*.csv",
+}
 
 MAX_MOTOR_TORKU_NM = 500.0          # Nm (tork % -> Nm dönüşümü için)
 P_RATED_KW = 91.9                   # kW (güç hesabı için)
@@ -13,9 +22,8 @@ TRANSPORT_ESIK_DEGERI = 10.0        # km/h
 IVME_ESIK_DEGERI = 0.5              # m/s^2
 LIFT_YUKARIDA_ESIK_DEGERI = 50.0    # %
 SIRA_SONU_DONUS_MIN_SURE = 1.0      # s
-SIRA_SONU_DONUS_MAX_SURE = 300.0    # s  (Excel’de 300)
+SIRA_SONU_DONUS_MAX_SURE = 300.0    # s
 
-# PTO kolonu dosyada varsa kullan
 PTO_COL_CANDIDATES = [
     "Rear PTO output shaft speed",
     "PTO_Speed",
@@ -25,10 +33,9 @@ PTO_COL_CANDIDATES = [
 ]
 
 # ============================================================
-# 1) 0-1 normalize için MIN-MAX (Excel tablonla aynı + 20.saniye)
+# 1) 0-1 normalize için MIN-MAX
 # ============================================================
 MINMAX = {
-    # 1-8
     "ORTALAMA_MOTOR_TORKU": (0.0, 100.0),
     "ORTALAMA_MOTOR_GUCU": (0.0, 91.9),
     "MOTOR_GUCU_STANDART_SAPMA": (0.0, 91.9),
@@ -38,27 +45,24 @@ MINMAX = {
     "ORTALAMA_TRAKTOR_HIZI": (0.0, 45.0),
     "OPERASYON_SURESI": (0.0, 10.0),
 
-    # 9-12 (transport)
     "KAT_EDILEN_MESAFE": (0.0, 50.0),
     "ANI_HIZLANMA_SAYISI": (0.0, 100.0),
     "ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI": (0.0, 2.0),
     "ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI": (0.0, 91.9),
 
-    # 13-20 (field)
     "TOPLAM_SIRA_SONU_DONUS_SAYISI": (0.0, 200.0),
     "ORTALAMA_TARLA_SURME_HIZI_SURERKEN": (0.0, 45.0),
-    "ORTALAMA_MOTOR_TORKU_SURERKEN": (0.0, 500.0),   # Nm
+    "ORTALAMA_MOTOR_TORKU_SURERKEN": (0.0, 500.0),
     "ORTALAMA_MOTOR_GUCU_SURERKEN": (0.0, 91.9),
     "ORTALAMA_PTO_DEVRI_SURERKEN": (0.0, 2550.0),
     "ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN": (0.0, 100.0),
     "ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN": (0.0, 100.0),
 
-    # ✅ 20 artık saniye: 0..300 s
     "SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN": (0.0, 300.0),
 }
 
 # ============================================================
-# 2) BİRİMLER (20 artık saniye)
+# 2) BİRİMLER
 # ============================================================
 UNITS = {
     "ORTALAMA_MOTOR_TORKU": "%",
@@ -82,12 +86,9 @@ UNITS = {
     "ORTALAMA_PTO_DEVRI_SURERKEN": "rpm",
     "ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN": "%",
     "ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN": "%",
-
-    # ✅ saniye
     "SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN": "s",
 }
 
-# Yazdırma sırası (1..20)
 ORDER = [
     "ORTALAMA_MOTOR_TORKU",
     "ORTALAMA_MOTOR_GUCU",
@@ -112,8 +113,12 @@ ORDER = [
 ]
 
 # ============================================================
-# 3) YARDIMCI FONKSİYONLAR
+# 3) YARDIMCI
 # ============================================================
+def natural_key(s: str):
+    #  ..._2 ..._10 sıralaması doğru olsun diye
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
 def first_existing_col(df, candidates):
     for c in candidates:
         if c in df.columns:
@@ -126,18 +131,18 @@ def safe_mean(x):
 
 def safe_std(x):
     x = np.asarray(x, dtype=float)
-    return float(np.nanstd(x, ddof=1)) if x.size > 1 else 0.0
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return 0.0
+    return float(np.std(x, ddof=1))
 
 def round3(x):
-    if x is None:
-        return None
     try:
         return round(float(x), 3)
     except Exception:
         return None
 
 def norm01(name, raw_value):
-    """MIN-MAX'e göre 0-1 normalize + clamp + 3 basamak."""
     if name not in MINMAX:
         return None
     mn, mx = MINMAX[name]
@@ -148,11 +153,6 @@ def norm01(name, raw_value):
     return round3(v)
 
 def detect_headland_turns_by_lift(df_all):
-    """
-    Dönüş tespiti:
-    LIFT_KONUM (=HtcPositionSensPerc) > 50 iken geçen süre
-    1..300 sn aralığındaysa 1 dönüş.
-    """
     if "HtcPositionSensPerc" not in df_all.columns:
         return np.zeros(len(df_all), dtype=bool), [], 0.0
 
@@ -162,6 +162,9 @@ def detect_headland_turns_by_lift(df_all):
     above = lift > LIFT_YUKARIDA_ESIK_DEGERI
     starts = np.where((~above[:-1]) & (above[1:]))[0] + 1
     ends = np.where((above[:-1]) & (~above[1:]))[0] + 1
+
+    if above[-1]:
+        ends = np.append(ends, len(df_all) - 1)
 
     intervals = []
     turn_mask = np.zeros(len(df_all), dtype=bool)
@@ -179,148 +182,90 @@ def detect_headland_turns_by_lift(df_all):
             intervals.append((s, e))
             turn_mask[s:e] = True
 
-    total_turn_s = 0.0
-    for (s, e) in intervals:
-        total_turn_s += float(t[e] - t[s])
-
+    total_turn_s = sum(float(t[e] - t[s]) for (s, e) in intervals)
     return turn_mask, intervals, total_turn_s
 
 # ============================================================
-# 4) VERİYİ OKU ve SİNYALLERİ HAZIRLA
+# 4) TEK DOSYA İŞLE
 # ============================================================
-df = pd.read_csv(FILE_PATH)
+def process_single_file(file_path):
+    df = pd.read_csv(file_path)
 
-numeric_cols = [
-    "Time",
-    "ActualEngine_PercTorque",
-    "EngineSpeed",
-    "EngFuelRate",
-    "Speed_kmh",
-    "WheelBasedVehicleSpeed",
-    "HtcDraftSens1Perc",
-    "HtcDraftSens2Perc",
-    "HtcPositionSensPerc",
-]
-for c in numeric_cols:
-    if c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    numeric_cols = [
+        "Time",
+        "ActualEngine_PercTorque",
+        "EngineSpeed",
+        "EngFuelRate",
+        "Speed_kmh",
+        "WheelBasedVehicleSpeed",
+        "HtcDraftSens1Perc",
+        "HtcDraftSens2Perc",
+        "HtcPositionSensPerc",
+    ]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-if "Time" not in df.columns:
-    raise ValueError("Dosyada 'Time' kolonu yok (timestamp gerekli).")
+    if "Time" not in df.columns:
+        raise ValueError(f"Dosyada 'Time' kolonu yok: {file_path}")
 
-df = df.dropna(subset=["Time"]).copy()
+    df = df.dropna(subset=["Time"]).copy()
+    df["Time_s"] = df["Time"] / 1000.0
+    df["dt_s"] = df["Time_s"].diff()
+    df = df[df["dt_s"].notna() & (df["dt_s"] > 0)].copy()
+    df = df.reset_index(drop=True)
 
-df["Time_s"] = df["Time"] / 1000.0
-df["dt_s"] = df["Time_s"].diff()
-df = df[df["dt_s"].notna() & (df["dt_s"] > 0)].copy()
-df = df.reset_index(drop=True)
+    speed_col = "WheelBasedVehicleSpeed" if "WheelBasedVehicleSpeed" in df.columns else "Speed_kmh"
+    if speed_col not in df.columns:
+        raise ValueError(f"Ne WheelBasedVehicleSpeed ne de Speed_kmh var: {file_path}")
 
-# Hız: WheelBasedVehicleSpeed varsa onu kullan, yoksa Speed_kmh
-speed_col = "WheelBasedVehicleSpeed" if "WheelBasedVehicleSpeed" in df.columns else "Speed_kmh"
-df["TRACTOR_SPEED_KMH"] = df[speed_col]
+    df["TRACTOR_SPEED_KMH"] = df[speed_col]
+    df["TRACTOR_SPEED_MS"] = df["TRACTOR_SPEED_KMH"] / 3.6
+    df["ACC_MS2"] = df["TRACTOR_SPEED_MS"].diff() / df["dt_s"]
 
-# İvme (m/s2)
-df["TRACTOR_SPEED_MS"] = df["TRACTOR_SPEED_KMH"] / 3.6
-df["ACC_MS2"] = df["TRACTOR_SPEED_MS"].diff() / df["dt_s"]
+    df["POWER_KW"] = np.nan
+    if "ActualEngine_PercTorque" in df.columns:
+        df["POWER_KW"] = P_RATED_KW * (df["ActualEngine_PercTorque"] / 100.0)
 
-# Güç (kW) proxy
-df["POWER_KW"] = np.nan
-if "ActualEngine_PercTorque" in df.columns:
-    df["POWER_KW"] = P_RATED_KW * (df["ActualEngine_PercTorque"] / 100.0)
+    df["TORQUE_NM"] = np.nan
+    if "ActualEngine_PercTorque" in df.columns:
+        df["TORQUE_NM"] = MAX_MOTOR_TORKU_NM * (df["ActualEngine_PercTorque"] / 100.0)
 
-# Tork (Nm) proxy
-df["TORQUE_NM"] = np.nan
-if "ActualEngine_PercTorque" in df.columns:
-    df["TORQUE_NM"] = MAX_MOTOR_TORKU_NM * (df["ActualEngine_PercTorque"] / 100.0)
+    op_s = float(df["Time_s"].iloc[-1] - df["Time_s"].iloc[0])
+    OPERASYON_SURESI = op_s / 3600.0
 
-# Operasyon süresi (h)
-op_s = float(df["Time_s"].iloc[-1] - df["Time_s"].iloc[0])
-OPERASYON_SURESI = op_s / 3600.0
+    # 1–8
+    ORTALAMA_MOTOR_TORKU = safe_mean(df["ActualEngine_PercTorque"]) if "ActualEngine_PercTorque" in df.columns else 0.0
+    ORTALAMA_MOTOR_GUCU = safe_mean(df["POWER_KW"])
+    MOTOR_GUCU_STANDART_SAPMA = safe_std(df["POWER_KW"])
+    ORTALAMA_MOTOR_DEVRI = safe_mean(df["EngineSpeed"]) if "EngineSpeed" in df.columns else 0.0
+    MOTOR_DEVRI_STANDART_SAPMA_DEGERI = safe_std(df["EngineSpeed"]) if "EngineSpeed" in df.columns else 0.0
+    ORTALAMA_YAKIT_TUKETIMI = safe_mean(df["EngFuelRate"]) if "EngFuelRate" in df.columns else 0.0
+    ORTALAMA_TRAKTOR_HIZI = safe_mean(df["TRACTOR_SPEED_KMH"])
 
-# ============================================================
-# 5) 1–8 (TÜM HAM VERİ)
-# ============================================================
-ORTALAMA_MOTOR_TORKU = safe_mean(df["ActualEngine_PercTorque"]) if "ActualEngine_PercTorque" in df.columns else 0.0
-ORTALAMA_MOTOR_GUCU = safe_mean(df["POWER_KW"])
-MOTOR_GUCU_STANDART_SAPMA = safe_std(df["POWER_KW"])
-ORTALAMA_MOTOR_DEVRI = safe_mean(df["EngineSpeed"]) if "EngineSpeed" in df.columns else 0.0
-MOTOR_DEVRI_STANDART_SAPMA_DEGERI = safe_std(df["EngineSpeed"]) if "EngineSpeed" in df.columns else 0.0
-ORTALAMA_YAKIT_TUKETIMI = safe_mean(df["EngFuelRate"]) if "EngFuelRate" in df.columns else 0.0
-ORTALAMA_TRAKTOR_HIZI = safe_mean(df["TRACTOR_SPEED_KMH"])
+    is_transport = ORTALAMA_TRAKTOR_HIZI > TRANSPORT_ESIK_DEGERI
+    is_field = ORTALAMA_TRAKTOR_HIZI < TRANSPORT_ESIK_DEGERI
 
-is_transport = ORTALAMA_TRAKTOR_HIZI > TRANSPORT_ESIK_DEGERI
-is_field = ORTALAMA_TRAKTOR_HIZI < TRANSPORT_ESIK_DEGERI
+    # 9–12 (taşıma)
+    KAT_EDILEN_MESAFE = 0.0
+    ANI_HIZLANMA_SAYISI = 0.0
+    ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI = 0.0
+    ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI = 0.0
 
-# ============================================================
-# 6) 9–12 (TAŞIMA)
-# ============================================================
-KAT_EDILEN_MESAFE = 0.0
-ANI_HIZLANMA_SAYISI = 0.0
-ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI = 0.0
-ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI = 0.0
+    if is_transport:
+        dt_h = df["dt_s"].to_numpy(dtype=float) / 3600.0
+        v_kmh = df["TRACTOR_SPEED_KMH"].to_numpy(dtype=float)
+        KAT_EDILEN_MESAFE = float(np.nansum(v_kmh * dt_h))
 
-if is_transport:
-    dt_h = df["dt_s"].to_numpy(dtype=float) / 3600.0
-    v_kmh = df["TRACTOR_SPEED_KMH"].to_numpy(dtype=float)
-    KAT_EDILEN_MESAFE = float(np.nansum(v_kmh * dt_h))
+        acc = df["ACC_MS2"].to_numpy(dtype=float)
+        acc_flag = acc > IVME_ESIK_DEGERI
+        ANI_HIZLANMA_SAYISI = float(np.sum((~acc_flag[:-1]) & (acc_flag[1:])))
 
-    acc = df["ACC_MS2"].to_numpy(dtype=float)
-    acc_flag = acc > IVME_ESIK_DEGERI
-    ANI_HIZLANMA_SAYISI = float(np.sum((~acc_flag[:-1]) & (acc_flag[1:])))
-    ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI = safe_mean(acc[acc_flag])
+        ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI = safe_mean(acc[acc_flag])
+        p = df["POWER_KW"].to_numpy(dtype=float)
+        ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI = safe_mean(p[acc_flag])
 
-    p = df["POWER_KW"].to_numpy(dtype=float)
-    ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI = safe_mean(p[acc_flag])
-
-# ============================================================
-# 7) 13–20 (TARLA) — "_SURERKEN" için df_work kullanılır
-# ============================================================
-TOPLAM_SIRA_SONU_DONUS_SAYISI = 0.0
-ORTALAMA_TARLA_SURME_HIZI_SURERKEN = 0.0
-ORTALAMA_MOTOR_TORKU_SURERKEN = 0.0
-ORTALAMA_MOTOR_GUCU_SURERKEN = 0.0
-ORTALAMA_PTO_DEVRI_SURERKEN = 0.0
-ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN = 0.0
-ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN = 0.0
-
-# ✅ 20 artık saniye
-SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN = 0.0  # s
-
-turn_total_s = 0.0
-turn_ratio = 0.0
-
-if is_field:
-    turn_mask, intervals, turn_total_s = detect_headland_turns_by_lift(df)
-    TOPLAM_SIRA_SONU_DONUS_SAYISI = float(len(intervals))
-
-    df_work = df.loc[~turn_mask].copy()
-
-    if len(df_work) > 0:
-        ORTALAMA_TARLA_SURME_HIZI_SURERKEN = safe_mean(df_work["TRACTOR_SPEED_KMH"])
-        ORTALAMA_MOTOR_TORKU_SURERKEN = safe_mean(df_work["TORQUE_NM"])
-        ORTALAMA_MOTOR_GUCU_SURERKEN = safe_mean(df_work["POWER_KW"])
-
-        pto_col = first_existing_col(df_work, PTO_COL_CANDIDATES)
-        if pto_col is not None:
-            df_work[pto_col] = pd.to_numeric(df_work[pto_col], errors="coerce")
-            ORTALAMA_PTO_DEVRI_SURERKEN = safe_mean(df_work[pto_col])
-
-        if ("HtcDraftSens1Perc" in df_work.columns) and ("HtcDraftSens2Perc" in df_work.columns):
-            draft_avg = (df_work["HtcDraftSens1Perc"].to_numpy(dtype=float) +
-                         df_work["HtcDraftSens2Perc"].to_numpy(dtype=float)) / 2.0
-            ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN = safe_mean(draft_avg)
-            ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN = safe_std(draft_avg)
-
-    # ✅ 20: dönüşlerde geçirilen ortalama zaman (s)
-    if TOPLAM_SIRA_SONU_DONUS_SAYISI > 0:
-        SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN = (turn_total_s / TOPLAM_SIRA_SONU_DONUS_SAYISI)
-    else:
-        SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN = 0.0
-
-    turn_ratio = (turn_total_s / op_s) if op_s > 0 else 0.0
-
-# Kurallar: taşıma ise 13-20=0, tarla ise 9-12=0
-if is_transport:
+    # 13–20 (tarla)
     TOPLAM_SIRA_SONU_DONUS_SAYISI = 0.0
     ORTALAMA_TARLA_SURME_HIZI_SURERKEN = 0.0
     ORTALAMA_MOTOR_TORKU_SURERKEN = 0.0
@@ -330,65 +275,158 @@ if is_transport:
     ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN = 0.0
     SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN = 0.0
 
-if is_field:
-    KAT_EDILEN_MESAFE = 0.0
-    ANI_HIZLANMA_SAYISI = 0.0
-    ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI = 0.0
-    ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI = 0.0
+    if is_field:
+        turn_mask, intervals, turn_total_s = detect_headland_turns_by_lift(df)
+        TOPLAM_SIRA_SONU_DONUS_SAYISI = float(len(intervals))
+
+        df_work = df.loc[~turn_mask].copy()
+
+        if len(df_work) > 0:
+            ORTALAMA_TARLA_SURME_HIZI_SURERKEN = safe_mean(df_work["TRACTOR_SPEED_KMH"])
+            ORTALAMA_MOTOR_TORKU_SURERKEN = safe_mean(df_work["TORQUE_NM"])
+            ORTALAMA_MOTOR_GUCU_SURERKEN = safe_mean(df_work["POWER_KW"])
+
+            pto_col = first_existing_col(df_work, PTO_COL_CANDIDATES)
+            if pto_col is not None:
+                df_work[pto_col] = pd.to_numeric(df_work[pto_col], errors="coerce")
+                ORTALAMA_PTO_DEVRI_SURERKEN = safe_mean(df_work[pto_col])
+
+            if ("HtcDraftSens1Perc" in df_work.columns) and ("HtcDraftSens2Perc" in df_work.columns):
+                draft_avg = (df_work["HtcDraftSens1Perc"].to_numpy(dtype=float) +
+                             df_work["HtcDraftSens2Perc"].to_numpy(dtype=float)) / 2.0
+                ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN = safe_mean(draft_avg)
+                ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN = safe_std(draft_avg)
+
+        if TOPLAM_SIRA_SONU_DONUS_SAYISI > 0:
+            SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN = (turn_total_s / TOPLAM_SIRA_SONU_DONUS_SAYISI)
+        else:
+            SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN = 0.0
+
+    # Kurallar: taşıma ise 13-20=0, tarla ise 9-12=0
+    if is_transport:
+        TOPLAM_SIRA_SONU_DONUS_SAYISI = 0.0
+        ORTALAMA_TARLA_SURME_HIZI_SURERKEN = 0.0
+        ORTALAMA_MOTOR_TORKU_SURERKEN = 0.0
+        ORTALAMA_MOTOR_GUCU_SURERKEN = 0.0
+        ORTALAMA_PTO_DEVRI_SURERKEN = 0.0
+        ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN = 0.0
+        ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN = 0.0
+        SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN = 0.0
+
+    if is_field:
+        KAT_EDILEN_MESAFE = 0.0
+        ANI_HIZLANMA_SAYISI = 0.0
+        ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI = 0.0
+        ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI = 0.0
+
+    raw_result = {
+        "ORTALAMA_MOTOR_TORKU": ORTALAMA_MOTOR_TORKU,
+        "ORTALAMA_MOTOR_GUCU": ORTALAMA_MOTOR_GUCU,
+        "MOTOR_GUCU_STANDART_SAPMA": MOTOR_GUCU_STANDART_SAPMA,
+        "ORTALAMA_MOTOR_DEVRI": ORTALAMA_MOTOR_DEVRI,
+        "MOTOR_DEVRI_STANDART_SAPMA_DEGERI": MOTOR_DEVRI_STANDART_SAPMA_DEGERI,
+        "ORTALAMA_YAKIT_TUKETIMI": ORTALAMA_YAKIT_TUKETIMI,
+        "ORTALAMA_TRAKTOR_HIZI": ORTALAMA_TRAKTOR_HIZI,
+        "OPERASYON_SURESI": OPERASYON_SURESI,
+
+        "KAT_EDILEN_MESAFE": KAT_EDILEN_MESAFE,
+        "ANI_HIZLANMA_SAYISI": ANI_HIZLANMA_SAYISI,
+        "ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI": ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI,
+        "ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI": ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI,
+
+        "TOPLAM_SIRA_SONU_DONUS_SAYISI": TOPLAM_SIRA_SONU_DONUS_SAYISI,
+        "ORTALAMA_TARLA_SURME_HIZI_SURERKEN": ORTALAMA_TARLA_SURME_HIZI_SURERKEN,
+        "ORTALAMA_MOTOR_TORKU_SURERKEN": ORTALAMA_MOTOR_TORKU_SURERKEN,
+        "ORTALAMA_MOTOR_GUCU_SURERKEN": ORTALAMA_MOTOR_GUCU_SURERKEN,
+        "ORTALAMA_PTO_DEVRI_SURERKEN": ORTALAMA_PTO_DEVRI_SURERKEN,
+        "ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN": ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN,
+        "ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN": ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN,
+        "SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN": SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN,
+    }
+
+    raw_out = {k: round3(raw_result.get(k, 0.0)) for k in ORDER}
+    norm_out = {k: norm01(k, raw_result.get(k, 0.0)) for k in ORDER}
+    return raw_out, norm_out
 
 # ============================================================
-# 8) TABLO ÇIKTISI (3 basamak)
+# 5) GRUP TABLOSU OLUŞTUR (satır metrik, sütun task)
 # ============================================================
-task_name = os.path.splitext(os.path.basename(FILE_PATH))[0]
+def build_group_tables(files):
+    tasks = []
+    raw_by_task = {}
+    norm_by_task = {}
 
-raw_result = {
-    "ORTALAMA_MOTOR_TORKU": ORTALAMA_MOTOR_TORKU,
-    "ORTALAMA_MOTOR_GUCU": ORTALAMA_MOTOR_GUCU,
-    "MOTOR_GUCU_STANDART_SAPMA": MOTOR_GUCU_STANDART_SAPMA,
-    "ORTALAMA_MOTOR_DEVRI": ORTALAMA_MOTOR_DEVRI,
-    "MOTOR_DEVRI_STANDART_SAPMA_DEGERI": MOTOR_DEVRI_STANDART_SAPMA_DEGERI,
-    "ORTALAMA_YAKIT_TUKETIMI": ORTALAMA_YAKIT_TUKETIMI,
-    "ORTALAMA_TRAKTOR_HIZI": ORTALAMA_TRAKTOR_HIZI,
-    "OPERASYON_SURESI": OPERASYON_SURESI,
+    for fp in files:
+        task_name = os.path.splitext(os.path.basename(fp))[0]
+        raw_out, norm_out = process_single_file(fp)
+        tasks.append(task_name)
+        raw_by_task[task_name] = raw_out
+        norm_by_task[task_name] = norm_out
 
-    "KAT_EDILEN_MESAFE": KAT_EDILEN_MESAFE,
-    "ANI_HIZLANMA_SAYISI": ANI_HIZLANMA_SAYISI,
-    "ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI": ANI_HIZLANMALARIN_ORTALAMA_IVME_DEGERI,
-    "ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI": ANI_IVMELENMELER_ANINDAKI_ORTALAMA_GUC_DEGERI,
-
-    "TOPLAM_SIRA_SONU_DONUS_SAYISI": TOPLAM_SIRA_SONU_DONUS_SAYISI,
-    "ORTALAMA_TARLA_SURME_HIZI_SURERKEN": ORTALAMA_TARLA_SURME_HIZI_SURERKEN,
-    "ORTALAMA_MOTOR_TORKU_SURERKEN": ORTALAMA_MOTOR_TORKU_SURERKEN,
-    "ORTALAMA_MOTOR_GUCU_SURERKEN": ORTALAMA_MOTOR_GUCU_SURERKEN,
-    "ORTALAMA_PTO_DEVRI_SURERKEN": ORTALAMA_PTO_DEVRI_SURERKEN,
-    "ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN": ORTALAMA_ARKA_CEKI_KUVVETI_SURERKEN,
-    "ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN": ARKA_CEKI_KUVVETI_STANDART_SAPMA_DEGERI_SURERKEN,
-    "SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN": SIRA_SONU_DONUSLERDE_GECIRILEN_ORTALAMA_ZAMAN,
-}
-
-rows = []
-for key in ORDER:
-    raw_val = float(raw_result.get(key, 0.0))
-    rows.append({
-        "METRIK": key,
-        "RAW": round3(raw_val),
-        "BIRIM": UNITS.get(key, "-"),
-        "NORM01": norm01(key, raw_val),
+    base = pd.DataFrame({
+        "METRIK": ORDER,
+        "BIRIM": [UNITS.get(k, "-") for k in ORDER],
     })
 
-out_df = pd.DataFrame(rows)
+    raw_matrix = pd.DataFrame({t: [raw_by_task[t].get(k, 0.0) for k in ORDER] for t in tasks})
+    norm_matrix = pd.DataFrame({t: [norm_by_task[t].get(k, None) for k in ORDER] for t in tasks})
 
-print(f"\n=== {task_name} ===")
-print(out_df.to_string(index=False))
+    raw_sheet = pd.concat([base, raw_matrix], axis=1)
+    norm_sheet = pd.concat([base, norm_matrix], axis=1)
 
-# Debug / kontrol bilgisi
-if is_field:
-    print("\n--- Headland (Sıra sonu dönüş) kontrol ---")
-    print(f"TOPLAM_SIRA_SONU_DONUS_SAYISI: {int(TOPLAM_SIRA_SONU_DONUS_SAYISI)}")
-    print(f"Toplam dönüş süresi (s): {round3(turn_total_s)}")
-    print(f"Toplam operasyon süresi (s): {round3(op_s)}")
-    print(f"Dönüş süresi oranı (%): {round3(100.0 * turn_ratio)}")
+    return raw_sheet, norm_sheet, tasks
 
-    # ============================================================
-    # OPSİYONEL: ZAMAN SERİSİ ÇIKTISI (İSTEĞE BAĞLI)
-    # ============================================================
+# ============================================================
+# 6) MAIN: PULLUK + TASIMA -> 4 sheet Excel
+# ============================================================
+def main():
+    group_outputs = {}
+
+    for group_name, pattern in PATTERNS.items():
+        glob_path = os.path.join(BASE_DIR, pattern)
+        files = glob.glob(glob_path)
+        files = sorted(files, key=lambda x: natural_key(os.path.basename(x)))
+
+        if not files:
+            print(f"[UYARI] {group_name}: Dosya bulunamadı -> {glob_path}")
+            continue
+
+        raw_sheet, norm_sheet, tasks = build_group_tables(files)
+        group_outputs[group_name] = {
+            "RAW": raw_sheet,
+            "NORM01": norm_sheet,
+            "TASKS": tasks,
+        }
+
+        print(f"[OK] {group_name}: {len(files)} dosya işlendi.")
+
+    if not group_outputs:
+        raise FileNotFoundError("Hiçbir grupta dosya bulunamadı. Pattern/klasör kontrol et.")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_xlsx = os.path.join(BASE_DIR, f"SUMMARY_9000_{ts}.xlsx")
+
+    # sende xlsxwriter var (önceki stack trace bunu gösteriyordu)
+    with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
+        wb = writer.book
+
+        for group_name, data in group_outputs.items():
+            for sheet_type in ["RAW", "NORM01"]:
+                sheet_name = f"{group_name}_{sheet_type}"  # PULLUK_RAW vb.
+                df_sheet = data[sheet_type]
+                df_sheet.to_excel(writer, index=False, sheet_name=sheet_name)
+
+                ws = writer.sheets[sheet_name]
+                ws.freeze_panes(1, 2)          # 1. satır + ilk 2 sütun sabit
+                ws.set_column(0, 0, 45)        # METRIK
+                ws.set_column(1, 1, 10)        # BIRIM
+                ws.set_column(2, 2 + len(data["TASKS"]), 18)  # TASK sütunları
+
+    print("\n==============================")
+    print("Tüm gruplar işlendi ✅")
+    print(f"Özet Excel kaydedildi: {out_xlsx}")
+    print("Sheet'ler: PULLUK_RAW, PULLUK_NORM01, TASIMA_RAW, TASIMA_NORM01")
+    print("==============================\n")
+
+if __name__ == "__main__":
+    main()
