@@ -7,7 +7,7 @@ from tkinter import ttk, messagebox
 
 import numpy as np
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
 try:
@@ -33,12 +33,21 @@ class CompareWindow(tk.Toplevel):
         plot_frame = ttk.LabelFrame(main, text="Seçilen Bölgeler")
         plot_frame.pack(fill="both", expand=True)
 
+        # Şekil + Canvas
         self.fig = Figure(figsize=(6, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.grid(True)
 
+        # Toolbar üstte
+        toolbar_frame = ttk.Frame(plot_frame)
+        toolbar_frame.pack(side="top", fill="x")
+
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas_widget = self.canvas.get_tk_widget()
+        self.canvas_widget.pack(side="top", fill="both", expand=True)
+
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
 
         bottom = ttk.Frame(main)
         bottom.pack(fill="x", pady=5)
@@ -152,6 +161,7 @@ class ViewerWindow(tk.Toplevel):
     - Rising / Falling / Pad ayarları
     - Turuncu alanlarda trigger mantığı
     - Turuncu alanı seçip Karşılaştırma ekranına segment ekleme
+    - Profesyonel Matplotlib toolbar (zoom, pan, home, save...)
     """
     def __init__(self, master, filepath):
         super().__init__(master)
@@ -208,17 +218,27 @@ class ViewerWindow(tk.Toplevel):
                    command=self.open_compare_window)\
             .grid(row=4, column=0, columnspan=2, pady=3, sticky="we")
 
-        # Grafik
+        # Grafik alanı
         plot = ttk.LabelFrame(self, text="Grafik")
         plot.pack(fill="both", expand=True, padx=5, pady=5)
 
+        # Figure
         self.fig = Figure(figsize=(6, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.grid(True)
 
+        # Toolbar üstte
+        toolbar_frame = ttk.Frame(plot)
+        toolbar_frame.pack(side="top", fill="x")
+
+        # Canvas
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot)
         self.canvas_widget = self.canvas.get_tk_widget()
-        self.canvas_widget.pack(fill="both", expand=True)
+        self.canvas_widget.pack(side="top", fill="both", expand=True)
+
+        # Toolbar (zoom/pan/home/save vs.)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
 
         # Turuncu alan seçimi için matplotlib event'leri
         self.canvas.mpl_connect("button_press_event", self.on_press)
@@ -354,6 +374,7 @@ class ViewerWindow(tk.Toplevel):
         self.ax.legend()
         self.ax.grid(True)
         self.canvas.draw()
+        self.toolbar.update()
 
     # -------------------------------------------------
     # Turuncu alan seçimi (click & drag)
@@ -376,7 +397,6 @@ class ViewerWindow(tk.Toplevel):
         if self._drag_interval_index is None:
             return
 
-        # Karşılaştırma penceresi yoksa hiç uğraşma
         compare_win = self.master_app.ensure_compare_window()
         if compare_win is None:
             self._drag_interval_index = None
