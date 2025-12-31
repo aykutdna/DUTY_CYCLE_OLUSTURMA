@@ -17,14 +17,80 @@ except ImportError:
 
 
 # =========================================================
-# Karşılaştırma Penceresi (ortak, çok segmentli)
+# Ortak: Hareketli / yeniden boyutlandırılabilir panel sınıfı
 # =========================================================
-class CompareWindow(tk.Toplevel):
-    def __init__(self, master):
-        super().__init__(master)
-        self.title("Karşılaştırma Ekranı")
-        self.geometry("900x500")
+class MovablePanel(ttk.Frame):
+    """
+    Sağ taraftaki çalışma alanında yer alan tüm paneller için temel sınıf:
+    - Başlık çubuğundan sürükleyerek taşıma
+    - Sağ alt köşedeki grip ile yeniden boyutlandırma
+    - X butonu ile panel kapama
+    """
+    def __init__(self, master_canvas, app, title="Panel"):
+        super().__init__(master_canvas)
+        self.app = app
+        self.master_canvas = master_canvas
 
+        # --- Başlık çubuğu ---
+        header = ttk.Frame(self, relief="raised")
+        header.pack(side="top", fill="x")
+
+        self.title_label = ttk.Label(header, text=title, anchor="w")
+        self.title_label.pack(side="left", padx=4)
+
+        close_btn = ttk.Button(header, text="X", width=2,
+                               command=self._on_close)
+        close_btn.pack(side="right", padx=2)
+
+        for w in (header, self.title_label):
+            w.bind("<Button-1>", self._on_header_press)
+            w.bind("<B1-Motion>", self._on_header_drag)
+            w.bind("<ButtonRelease-1>", self._on_header_release)
+
+        # --- Alt kısım: resize grip ---
+        bottom_bar = ttk.Frame(self)
+        bottom_bar.pack(side="bottom", fill="x")
+        self.size_grip = ttk.Sizegrip(bottom_bar)
+        self.size_grip.pack(side="right")
+
+        for w in (self.size_grip,):
+            w.bind("<Button-1>", self._on_resize_press)
+            w.bind("<B1-Motion>", self._on_resize_drag)
+            w.bind("<ButtonRelease-1>", self._on_resize_release)
+
+    # ---- header drag delegasyonları ----
+    def _on_header_press(self, event):
+        self.app.set_active_panel(self)
+        self.app.start_move_panel(self, event)
+
+    def _on_header_drag(self, event):
+        self.app.drag_move_panel(self, event)
+
+    def _on_header_release(self, event):
+        self.app.end_move_panel(self, event)
+
+    # ---- resize delegasyonları ----
+    def _on_resize_press(self, event):
+        self.app.set_active_panel(self)
+        self.app.start_resize_panel(self, event)
+
+    def _on_resize_drag(self, event):
+        self.app.drag_resize_panel(self, event)
+
+    def _on_resize_release(self, event):
+        self.app.end_resize_panel(self, event)
+
+    # ---- kapatma ----
+    def _on_close(self):
+        self.app.close_panel(self)
+
+
+# =========================================================
+# Karşılaştırma Paneli (çok segmentli, ortak)
+# =========================================================
+class ComparePanel(MovablePanel):
+    def __init__(self, master_canvas, app):
+        super().__init__(master_canvas, app, title="Karşılaştırma")
         self.segments = []  # her biri: {file, channel, seg_index, t_rel, y}
 
         main = ttk.Frame(self)
@@ -105,6 +171,7 @@ class CompareWindow(tk.Toplevel):
         self.ax.set_title("Seçilen turuncu bölgelerin karşılaştırması")
         self.ax.legend()
         self.canvas.draw()
+        self.toolbar.update()
 
         self.status_label.config(text=f"{len(self.segments)} segment")
 
@@ -152,74 +219,37 @@ class CompareWindow(tk.Toplevel):
 
 
 # =========================================================
-# DXD Viewer (tek dosya, tek kanal + trigger + karşılaştırma)
+# DXD Viewer Paneli (sadece grafik + trigger mantığı)
 # =========================================================
-class ViewerWindow(tk.Toplevel):
+class ViewerPanel(MovablePanel):
     """
-    Her DXD dosyası ayrı pencerede gösterilir.
-    - Tek kanal seçimi (Combobox)
-    - Rising / Falling / Pad ayarları
-    - Turuncu alanlarda trigger mantığı
-    - Turuncu alanı seçip Karşılaştırma ekranına segment ekleme
-    - Profesyonel Matplotlib toolbar (zoom, pan, home, save...)
+    Her DXD dosyası sağ taraftaki çalışma alanında ayrı bir panel olarak gösterilir.
+    Bu panelde sadece:
+      - Başlık çubuğu (dosya adı)
+      - Grafik (Matplotlib + toolbar)
+    Kontrol (kanal seçimi, trigger vs.) sol alttaki sabit paneldedir.
     """
-    def __init__(self, master, filepath):
-        super().__init__(master)
-        self.title(f"DNASoft X - {os.path.basename(filepath)}")
-        self.geometry("1100x700")
-
-        self.master_app = master   # DxdViewerApp referansı
+    def __init__(self, master_canvas, app, filepath):
+        title = os.path.basename(filepath)
+        super().__init__(master_canvas, app, title=title)
         self.filepath = filepath
         self.dwfile = None
 
-        # trigger değerleri
-        self.rising_val = tk.DoubleVar(value=10.0)
-        self.falling_val = tk.DoubleVar(value=18.0)
-        self.pad_sec = tk.DoubleVar(value=1.0)
-
-        # son çizilen veriyi ve aralıkları saklayalım
         self.last_t = None
         self.last_y = None
         self.last_chan = None
         self.intervals = []  # [(t0, t1), ...]
 
-        # drag seçim için
-        self._drag_interval_index = None
-
+        # UI
         self._build_ui()
-        self._open_file()
+        self._load_file()
+        self.show_blank()
 
     def _build_ui(self):
-        # Kanal + trigger paneli
-        top = ttk.Frame(self)
-        top.pack(fill="x", pady=5)
+        content = ttk.Frame(self)
+        content.pack(fill="both", expand=True)
 
-        ttk.Label(top, text="Kanal:").pack(side="left")
-        self.channel_combo = ttk.Combobox(top, state="readonly", width=40)
-        self.channel_combo.pack(side="left", padx=5)
-        self.channel_combo.bind("<<ComboboxSelected>>", lambda e: self._update_plot())
-
-        trig = ttk.LabelFrame(top, text="Trigger")
-        trig.pack(side="left", padx=10)
-
-        ttk.Label(trig, text="Rising >").grid(row=0, column=0, sticky="w")
-        ttk.Entry(trig, textvariable=self.rising_val, width=6).grid(row=0, column=1, padx=2)
-
-        ttk.Label(trig, text="Falling <").grid(row=1, column=0, sticky="w")
-        ttk.Entry(trig, textvariable=self.falling_val, width=6).grid(row=1, column=1, padx=2)
-
-        ttk.Label(trig, text="Pad (s)").grid(row=2, column=0, sticky="w")
-        ttk.Entry(trig, textvariable=self.pad_sec, width=6).grid(row=2, column=1, padx=2)
-
-        ttk.Button(trig, text="Uygula", command=self._update_plot)\
-            .grid(row=3, column=0, columnspan=2, pady=3, sticky="we")
-
-        ttk.Button(trig, text="Karşılaştırma Ekranı Aç",
-                   command=self.open_compare_window)\
-            .grid(row=4, column=0, columnspan=2, pady=3, sticky="we")
-
-        # Grafik alanı
-        plot = ttk.LabelFrame(self, text="Grafik")
+        plot = ttk.LabelFrame(content, text="Grafik")
         plot.pack(fill="both", expand=True, padx=5, pady=5)
 
         # Figure
@@ -240,42 +270,49 @@ class ViewerWindow(tk.Toplevel):
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
 
-        # Turuncu alan seçimi için matplotlib event'leri
+        # Eventler
         self.canvas.mpl_connect("button_press_event", self.on_press)
         self.canvas.mpl_connect("button_release_event", self.on_release)
 
-    def open_compare_window(self):
-        self.master_app.ensure_compare_window()
-
-    def _open_file(self):
+    def _load_file(self):
+        if dw is None:
+            return
         try:
             self.dwfile = dw.DWFile(self.filepath)
-            chan_names = sorted(list(self.dwfile.keys()))
-            self.channel_combo["values"] = chan_names
-            if chan_names:
-                self.channel_combo.current(0)
-                self._update_plot()
         except Exception as e:
-            messagebox.showerror("Hata", str(e))
+            messagebox.showerror("Hata", f"DXD okunamadı:\n{e}")
+            self.dwfile = None
 
-    # -------------------------------------------------
-    # Trigger mantığı + turuncu alan çizimi
-    # -------------------------------------------------
-    def _update_plot(self):
+    def get_channels(self):
+        if self.dwfile is None:
+            return []
+        try:
+            return sorted(list(self.dwfile.keys()))
+        except Exception:
+            return []
+
+    def show_blank(self):
         self.ax.clear()
-        self.intervals = []
-        self.last_t = None
-        self.last_y = None
-        self.last_chan = None
+        self.ax.grid(True)
+        self.ax.set_title(os.path.basename(self.filepath))
+        self.canvas.draw()
+        self.toolbar.update()
 
-        chan = self.channel_combo.get()
-        if not chan:
-            self.ax.set_title("Kanal seçilmedi")
-            self.canvas.draw()
+    def plot_channel(self, chan, rising=None, falling=None, pad=0.0, apply_trigger=True):
+        if self.dwfile is None:
             return
 
-        s = self.dwfile[chan].series()
+        if not chan:
+            return
+
+        try:
+            s = self.dwfile[chan].series()
+        except Exception as e:
+            messagebox.showerror("Hata", f"Kanal okunamadı:\n{e}")
+            return
+
         if s is None or s.empty:
+            self.ax.clear()
             self.ax.set_title("Veri boş")
             self.canvas.draw()
             return
@@ -287,99 +324,102 @@ class ViewerWindow(tk.Toplevel):
         self.last_y = y
         self.last_chan = chan
 
-        # Ana eğri
+        self.ax.clear()
+        self.ax.grid(True)
         self.ax.plot(t, y, label=chan)
-
-        rising = float(self.rising_val.get())
-        falling = float(self.falling_val.get())
-        pad = float(self.pad_sec.get())
 
         intervals = []
 
-        if falling < rising:
-            falling = rising
+        if apply_trigger and rising is not None:
+            # trigger hesap
+            r = float(rising)
+            f = float(falling) if falling is not None else r
+            p = float(pad) if pad is not None else 0.0
 
-        if abs(falling - rising) < 1e-9:
-            # Tek eşik
-            thr = rising
-            state = "below"
-            t_start = None
+            if f < r:
+                f = r
 
-            for i in range(len(y) - 1):
-                y0, y1 = y[i], y[i+1]
-                t1 = t[i+1]
+            if abs(f - r) < 1e-9:
+                # Tek eşik
+                thr = r
+                state = "below"
+                t_start = None
 
-                if state == "below":
-                    if (y0 < thr) and (y1 >= thr):
-                        t_start = t1
-                        state = "above"
+                for i in range(len(y) - 1):
+                    y0, y1 = y[i], y[i+1]
+                    t1 = t[i+1]
 
-                elif state == "above":
-                    if (y0 > thr) and (y1 <= thr):
-                        t_end = t1
-                        intervals.append((t_start, t_end))
-                        state = "below"
-                        t_start = None
-        else:
-            # Çift eşik: rising < falling
-            low = rising
-            high = falling
+                    if state == "below":
+                        if (y0 < thr) and (y1 >= thr):
+                            t_start = t1
+                            state = "above"
 
-            state = "waiting_rise"
-            t_start = None
-            seen_high = False
+                    elif state == "above":
+                        if (y0 > thr) and (y1 <= thr):
+                            t_end = t1
+                            intervals.append((t_start, t_end))
+                            state = "below"
+                            t_start = None
+            else:
+                # Çift eşik: rising < falling
+                low = r
+                high = f
 
-            for i in range(len(y) - 1):
-                y0, y1 = y[i], y[i+1]
-                t0, t1 = t[i], t[i+1]
+                state = "waiting_rise"
+                t_start = None
+                seen_high = False
 
-                if state == "waiting_rise":
-                    if (y0 < low) and (y1 >= low):
-                        t_start = t1
-                        state = "above_low"
-                        seen_high = False
+                for i in range(len(y) - 1):
+                    y0, y1 = y[i], y[i+1]
+                    t0, t1 = t[i], t[i+1]
 
-                elif state == "above_low":
-                    # 10'un altına düşersek reset
-                    if (y0 >= low) and (y1 < low):
-                        state = "waiting_rise"
-                        t_start = None
-                        seen_high = False
-                        continue
+                    if state == "waiting_rise":
+                        if (y0 < low) and (y1 >= low):
+                            t_start = t1
+                            state = "above_low"
+                            seen_high = False
 
-                    # 20'nin üzerine ilk kez çıkma
-                    if (not seen_high) and (y0 < high) and (y1 >= high):
-                        seen_high = True
+                    elif state == "above_low":
+                        # low'un altına düşersek reset
+                        if (y0 >= low) and (y1 < low):
+                            state = "waiting_rise"
+                            t_start = None
+                            seen_high = False
+                            continue
 
-                    # 20'nin üstünden 20'nin altına iniş → falling edge
-                    if seen_high and (y0 > high) and (y1 <= high):
-                        t_end = t1
-                        intervals.append((t_start, t_end))
-                        state = "waiting_rise"
-                        t_start = None
-                        seen_high = False
+                        # high'ın üzerine ilk kez çıkma
+                        if (not seen_high) and (y0 < high) and (y1 >= high):
+                            seen_high = True
 
-        # Bulunan aralıkları çiz
-        for (t0, t1) in intervals:
-            start = max(t0 - pad, t[0])
-            end = min(t1 + pad, t[-1])
+                        # high'ın üstünden high'ın altına iniş → falling edge
+                        if seen_high and (y0 > high) and (y1 <= high):
+                            t_end = t1
+                            intervals.append((t_start, t_end))
+                            state = "waiting_rise"
+                            t_start = None
+                            seen_high = False
 
-            self.ax.axvspan(start, end, color="orange", alpha=0.3)
-            self.ax.axvline(t0, color="green", linestyle="--", alpha=0.8)
-            self.ax.axvline(t1, color="red", linestyle="--", alpha=0.8)
+            # Bulunan aralıkları çiz
+            for (t0, t1) in intervals:
+                start = max(t0 - p, t[0])
+                end = min(t1 + p, t[-1])
+
+                self.ax.axvspan(start, end, color="orange", alpha=0.3)
+                self.ax.axvline(t0, color="green", linestyle="--", alpha=0.8)
+                self.ax.axvline(t1, color="red", linestyle="--", alpha=0.8)
 
         self.intervals = intervals
 
         self.ax.set_title(chan)
         self.ax.legend()
-        self.ax.grid(True)
         self.canvas.draw()
         self.toolbar.update()
 
     # -------------------------------------------------
-    # Turuncu alan seçimi (click & drag)
+    # Turuncu alan seçimi (tıklayıp segment ekleme)
     # -------------------------------------------------
     def on_press(self, event):
+        self.app.set_active_panel(self)
         if event.inaxes != self.ax or event.xdata is None:
             self._drag_interval_index = None
             return
@@ -397,8 +437,8 @@ class ViewerWindow(tk.Toplevel):
         if self._drag_interval_index is None:
             return
 
-        compare_win = self.master_app.ensure_compare_window()
-        if compare_win is None:
+        compare_panel = self.app.ensure_compare_panel()
+        if compare_panel is None:
             self._drag_interval_index = None
             return
 
@@ -407,23 +447,21 @@ class ViewerWindow(tk.Toplevel):
             return
 
         t0, t1 = self.intervals[self._drag_interval_index]
-        compare_win.add_segment(self.last_t, self.last_y, t0, t1,
-                                self.last_chan, self.filepath)
+        compare_panel.add_segment(self.last_t, self.last_y, t0, t1,
+                                  self.last_chan, self.filepath)
 
         self._drag_interval_index = None
 
 
 # =========================================================
-# Ana Uygulama: Launcher + Splash + Dahili Explorer
+# Ana Uygulama: Tek pencere + sol gezgin + alt kontroller + sağ çalışma alanı
 # =========================================================
 class DxdViewerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("DNASoft X - DXD Launcher")
-        self.geometry("800x200")
+        self.title("DNASoft X - DXD Viewer")
+        self.geometry("1400x800")
         self.last_folder = os.getcwd()
-
-        self.compare_window = None  # ortak karşılaştırma penceresi
 
         if dw is None:
             messagebox.showerror(
@@ -432,114 +470,156 @@ class DxdViewerApp(tk.Tk):
                 "Kurmak için:\n    pip install dwdatareader\n"
             )
 
-        self._build_ui()
-        self.withdraw()
-        self.after(0, self.show_splash)
+        # panel yönetimi (sağ taraftaki çalışma alanında)
+        self.panels = []  # {panel, win_id, x, y, w, h}
+        self.compare_panel = None
+        self.active_panel = None
 
-    def ensure_compare_window(self):
-        if self.compare_window is None or not tk.Toplevel.winfo_exists(self.compare_window):
-            self.compare_window = CompareWindow(self)
-        return self.compare_window
+        self._drag_state = None  # move/resize state
 
-    # --- Splash ekranı ---
-    def show_splash(self):
-        splash = tk.Toplevel(self)
-        splash.overrideredirect(True)
+        self._build_shell()
 
-        w, h = 700, 400
-        sw = splash.winfo_screenwidth()
-        sh = splash.winfo_screenheight()
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        splash.geometry(f"{w}x{h}+{x}+{y}")
+    # -------------------------------------------------
+    # Ana layout
+    # -------------------------------------------------
+    def _build_shell(self):
+        # Üst başlık
+        top_bar = ttk.Frame(self)
+        top_bar.pack(side="top", fill="x")
 
-        canvas = tk.Canvas(splash, width=w, height=h, highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
+        ttk.Label(
+            top_bar,
+            text="DNASoft X - DXD Viewer",
+            anchor="w",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left", padx=10, pady=5, fill="x", expand=True)
 
-        try:
-            base_dir = os.path.dirname(sys.argv[0])
-            img_path = os.path.join(base_dir, "splash_bg.png")
-            if os.path.exists(img_path):
-                bg_image = tk.PhotoImage(file=img_path)
-                canvas.bg_image = bg_image
-                canvas.create_image(w // 2, h // 2, image=bg_image)
-            else:
-                canvas.configure(bg="#202020")
-        except Exception:
-            canvas.configure(bg="#202020")
+        # Ana bölücü
+        main_pane = ttk.PanedWindow(self, orient="horizontal")
+        main_pane.pack(fill="both", expand=True)
 
-        canvas.create_text(10, 10, anchor="nw",
-                           text="https://validasyon.tumosan.com.tr:3000/",
-                           fill="#c0c0c0", font=("Segoe UI", 9))
-        canvas.create_text(w - 10, 10, anchor="ne",
-                           text="Copyright 2025 - 2025 Tümosan. Tüm hakları saklıdır.",
-                           fill="#c0c0c0", font=("Segoe UI", 9))
+        # Sol: Dosya gezgini + alt kontrol paneli
+        left_frame = ttk.Frame(main_pane, width=350)
+        main_pane.add(left_frame, weight=0)
 
-        canvas.create_text(w // 2, h // 2 - 40, anchor="center",
-                           text="DNASoft X",
-                           fill="white", font=("Segoe UI", 32, "bold"))
-        canvas.create_text(w // 2, h // 2 + 5, anchor="center",
-                           text="YENİ YILIN KUTLU OLSUN ALİ CAN",
-                           fill="#e0e0e0", font=("Segoe UI", 14))
+        # Sağ: Çalışma alanı
+        right_frame = ttk.Frame(main_pane)
+        main_pane.add(right_frame, weight=1)
 
-        canvas.create_text(20, h - 35, anchor="w",
-                           text="DEV-251230",
-                           fill="#909090", font=("Segoe UI", 10))
-        load_text = canvas.create_text(w - 20, h - 35, anchor="e",
-                                       text="loading exe...",
-                                       fill="#c0c0c0", font=("Segoe UI", 10))
+        self._build_left_side(left_frame)
+        self._build_workspace(right_frame)
 
-        margin = 60
-        bar_y1 = h - 25
-        bar_y2 = h - 15
-        canvas.create_rectangle(margin, bar_y1, w - margin, bar_y2,
-                                fill="#404040", outline="")
-        bar_fg = canvas.create_rectangle(margin, bar_y1, margin, bar_y2,
-                                         fill="#b0b0b0", outline="")
+    # -------------------------------------------------
+    # Sol taraf: üstte gezgin, altta kontrol paneli
+    # -------------------------------------------------
+    def _build_left_side(self, parent):
+        vpaned = ttk.PanedWindow(parent, orient="vertical")
+        vpaned.pack(fill="both", expand=True)
 
-        duration_ms = 5000
-        interval_ms = 50
-        steps = duration_ms // interval_ms
+        explorer_frame = ttk.Frame(vpaned)
+        control_frame = ttk.Frame(vpaned, relief="groove", borderwidth=1)
 
-        messages = [
-            "loading exe...",
-            "loading dxd...",
-            "loading grafana...",
-            "loading CAN bus...",
-            "initializing plots...",
-            "starting DNASoft X..."
-        ]
-        msg_count = len(messages)
-        msg_step = max(1, steps // msg_count)
+        vpaned.add(explorer_frame, weight=3)
+        vpaned.add(control_frame, weight=2)
 
-        def update_progress(step=0):
-            if step > steps:
-                splash.destroy()
-                self.deiconify()
-                return
+        self._build_file_explorer(explorer_frame)
+        self._build_control_panel(control_frame)
 
-            progress = step / steps
-            total_width = (w - margin) - margin
-            x1 = margin + int(total_width * progress)
-            canvas.coords(bar_fg, margin, bar_y1, x1, bar_y2)
+    # -------------------------------------------------
+    # Çalışma alanı (sağ)
+    # -------------------------------------------------
+    def _build_workspace(self, parent):
+        self.workspace_canvas = tk.Canvas(parent, background="#202020")
+        self.workspace_canvas.pack(fill="both", expand=True)
 
-            msg_index = min(msg_count - 1, step // msg_step)
-            canvas.itemconfig(load_text, text=messages[msg_index])
+        self.panel_offset = 0
 
-            splash.after(interval_ms, lambda: update_progress(step + 1))
+    def _create_panel_window(self, panel, width=700, height=400):
+        x = 20 + (self.panel_offset * 30)
+        y = 20 + (self.panel_offset * 30)
+        self.panel_offset += 1
 
-        update_progress(0)
+        win_id = self.workspace_canvas.create_window(
+            x, y, window=panel, anchor="nw", width=width, height=height
+        )
 
-    # --- Launcher UI ---
-    def _build_ui(self):
-        top = ttk.Frame(self)
-        top.pack(side="top", fill="x")
+        self.panels.append(
+            {
+                "panel": panel,
+                "win_id": win_id,
+                "x": x,
+                "y": y,
+                "w": width,
+                "h": height,
+            }
+        )
 
-        lbl = ttk.Label(top, text="DNASoft X - DXD Viewer Launcher", anchor="w")
-        lbl.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+    def open_dxd_panel(self, filepath):
+        panel = ViewerPanel(self.workspace_canvas, self, filepath)
+        self._create_panel_window(panel)
+        self.set_active_panel(panel)
 
-        ttk.Button(top, text="DXD Dosyası Aç...", command=self.ask_open_file)\
-            .pack(side="right", padx=10, pady=5)
+    # -------------------------------------------------
+    # Sol iç dosya gezgini
+    # -------------------------------------------------
+    def _build_file_explorer(self, parent):
+        # Başlık
+        title = ttk.Label(parent, text="Dosya Gezgini (DXD / D7D)", font=("Segoe UI", 10, "bold"))
+        title.pack(anchor="w", padx=5, pady=5)
+
+        # Klasör yolu
+        path_frame = ttk.Frame(parent)
+        path_frame.pack(fill="x", padx=5, pady=2)
+
+        self.path_var = tk.StringVar(value=self.last_folder)
+
+        ttk.Label(path_frame, text="Klasör:").pack(side="left")
+        path_entry = ttk.Entry(path_frame, textvariable=self.path_var)
+        path_entry.pack(side="left", fill="x", expand=True, padx=5)
+
+        ttk.Button(path_frame, text="Git", command=self.refresh_file_list).pack(side="right")
+
+        path_entry.bind("<Return>", lambda e: self.refresh_file_list())
+
+        # Alt paned: sürücüler + dosyalar
+        explorer_pane = ttk.PanedWindow(parent, orient="vertical")
+        explorer_pane.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Sürücüler / kısayollar
+        drv_frame = ttk.Frame(explorer_pane, height=120)
+        explorer_pane.add(drv_frame, weight=0)
+
+        ttk.Label(drv_frame, text="Sürücüler / Kısayollar").pack(anchor="w")
+
+        self.drv_list = tk.Listbox(drv_frame, height=6)
+        self.drv_list.pack(side="left", fill="both", expand=True)
+
+        drv_scroll = ttk.Scrollbar(drv_frame, orient="vertical", command=self.drv_list.yview)
+        drv_scroll.pack(side="right", fill="y")
+        self.drv_list.config(yscrollcommand=drv_scroll.set)
+
+        self.drv_list.bind("<Double-1>", self.on_drive_activate)
+        self.drv_list.bind("<Return>", self.on_drive_activate)
+
+        # Dosyalar
+        file_frame = ttk.Frame(explorer_pane)
+        explorer_pane.add(file_frame, weight=1)
+
+        self.file_list = tk.Listbox(file_frame)
+        self.file_list.pack(side="left", fill="both", expand=True)
+
+        file_scroll = ttk.Scrollbar(file_frame, orient="vertical",
+                                    command=self.file_list.yview)
+        file_scroll.pack(side="right", fill="y")
+        self.file_list.config(yscrollcommand=file_scroll.set)
+
+        self.file_list.bind("<Double-1>", self.open_selected_file)
+        self.file_list.bind("<Return>", self.open_selected_file)
+
+        self.file_entries = []
+
+        self.refresh_drives()
+        self.refresh_file_list()
 
     def _list_drives(self):
         drives = []
@@ -549,167 +629,349 @@ class DxdViewerApp(tk.Tk):
                 drives.append(drive)
         return drives
 
-    def ask_open_file(self):
-        win = tk.Toplevel(self)
-        win.title("DXD Dosyası Seç")
-        win.geometry("900x500")
+    def refresh_drives(self):
+        self.drv_list.delete(0, tk.END)
+        user_home = os.path.expanduser("~")
+        desktop = os.path.join(user_home, "Desktop")
+        projects = r"\\albil\tumosan\Tumosan_Ortak\Arge\Test_ve_Validasyon\11_Projeler"
 
-        top = ttk.Frame(win)
-        top.pack(fill="x", padx=5, pady=5)
+        self.drv_list.insert(tk.END, f"[K] Kullanıcı ({user_home})")
+        if os.path.isdir(desktop):
+            self.drv_list.insert(tk.END, f"[K] Desktop ({desktop})")
+        if os.path.isdir(projects):
+            self.drv_list.insert(tk.END, f"[K] 11_Projeler ({projects})")
 
-        path_var = tk.StringVar(value=self.last_folder)
+        for d in self._list_drives():
+            self.drv_list.insert(tk.END, f"[S] {d}")
 
-        ttk.Label(top, text="Klasör:").pack(side="left")
-        path_entry = ttk.Entry(top, textvariable=path_var)
-        path_entry.pack(side="left", fill="x", expand=True, padx=5)
+    def on_drive_activate(self, event=None):
+        sel = self.drv_list.curselection()
+        if not sel:
+            return
+        text = self.drv_list.get(sel[0])
 
-        def refresh_path(event=None):
-            refresh_file_list()
-
-        ttk.Button(top, text="Git", command=refresh_path).pack(side="right")
-
-        middle = ttk.PanedWindow(win, orient="horizontal")
-        middle.pack(fill="both", expand=True, padx=5, pady=5)
-
-        drv_frame = ttk.Frame(middle, width=220)
-        middle.add(drv_frame, weight=1)
-
-        ttk.Label(drv_frame, text="Sürücüler / Kısayollar").pack(anchor="w")
-
-        drv_list = tk.Listbox(drv_frame, width=28)
-        drv_list.pack(side="left", fill="y", expand=False)
-
-        drv_scroll = ttk.Scrollbar(drv_frame, orient="vertical", command=drv_list.yview)
-        drv_scroll.pack(side="right", fill="y")
-        drv_list.config(yscrollcommand=drv_scroll.set)
-
-        file_frame = ttk.Frame(middle)
-        middle.add(file_frame, weight=3)
-
-        file_list = tk.Listbox(file_frame, width=60)
-        file_list.pack(side="left", fill="both", expand=True)
-
-        file_scroll = ttk.Scrollbar(file_frame, orient="vertical",
-                                    command=file_list.yview)
-        file_scroll.pack(side="right", fill="y")
-        file_list.config(yscrollcommand=file_scroll.set)
-
-        entries = []
-
-        def refresh_drives():
-            drv_list.delete(0, tk.END)
-            user_home = os.path.expanduser("~")
-            desktop = os.path.join(user_home, "Desktop")
-            projects = r"\\albil\tumosan\Tumosan_Ortak\Arge\Test_ve_Validasyon\11_Projeler"
-
-            drv_list.insert(tk.END, f"[K] Kullanıcı ({user_home})")
-            if os.path.isdir(desktop):
-                drv_list.insert(tk.END, f"[K] Desktop ({desktop})")
-            if os.path.isdir(projects):
-                drv_list.insert(tk.END, f"[K] 11_Projeler ({projects})")
-
-            for d in self._list_drives():
-                drv_list.insert(tk.END, f"[S] {d}")
-
-        refresh_drives()
-
-        def on_drive_activate(event=None):
-            sel = drv_list.curselection()
-            if not sel:
-                return
-            text = drv_list.get(sel[0])
-
-            if text.startswith("[K]"):
-                if "(" in text and text.endswith(")"):
-                    base = text[text.index("(") + 1:-1]
-                else:
-                    return
-                target = base
-            elif text.startswith("[S]"):
-                parts = text.split()
-                target = parts[1]
+        if text.startswith("[K]"):
+            if "(" in text and text.endswith(")"):
+                base = text[text.index("(") + 1:-1]
             else:
                 return
+            target = base
+        elif text.startswith("[S]"):
+            parts = text.split()
+            target = parts[1]
+        else:
+            return
 
-            if os.path.isdir(target):
-                path_var.set(target)
-                refresh_file_list()
+        if os.path.isdir(target):
+            self.path_var.set(target)
+            self.refresh_file_list()
 
-        drv_list.bind("<Double-1>", on_drive_activate)
-        drv_list.bind("<Return>", on_drive_activate)
+    def refresh_file_list(self):
+        folder = os.path.abspath(self.path_var.get())
+        if not os.path.isdir(folder):
+            messagebox.showwarning("Klasör yok", folder)
+            return
 
-        def refresh_file_list():
-            nonlocal entries
-            folder = os.path.abspath(path_var.get())
-            if not os.path.isdir(folder):
-                messagebox.showwarning("Klasör yok", folder)
-                return
+        self.path_var.set(folder)
+        self.last_folder = folder
 
-            path_var.set(folder)
-            self.last_folder = folder
+        self.file_list.delete(0, tk.END)
+        self.file_entries = []
 
-            file_list.delete(0, tk.END)
-            entries = []
+        parent = os.path.dirname(folder)
+        if parent and parent != folder:
+            self.file_entries.append(("..", "up"))
+            self.file_list.insert(tk.END, "[..] Üst Klasör")
 
-            parent = os.path.dirname(folder)
-            if parent and parent != folder:
-                entries.append(("..", "up"))
-                file_list.insert(tk.END, "[..] Üst Klasör")
+        try:
+            all_items = os.listdir(folder)
+        except PermissionError:
+            messagebox.showwarning("Erişim yok", folder)
+            return
 
-            try:
-                all_items = os.listdir(folder)
-            except PermissionError:
-                messagebox.showwarning("Erişim yok", folder)
-                return
+        dirs = []
+        files = []
 
-            dirs = []
-            files = []
+        for name in all_items:
+            full = os.path.join(folder, name)
+            if os.path.isdir(full):
+                dirs.append(name)
+            elif name.lower().endswith(".dxd") or name.lower().endswith(".d7d"):
+                files.append(name)
 
-            for name in all_items:
-                full = os.path.join(folder, name)
-                if os.path.isdir(full):
-                    dirs.append(name)
-                elif name.lower().endswith(".dxd") or name.lower().endswith(".d7d"):
-                    files.append(name)
+        dirs.sort()
+        files.sort()
 
-            dirs.sort()
-            files.sort()
+        for d in dirs:
+            self.file_entries.append((d, "dir"))
+            self.file_list.insert(tk.END, f"[D] {d}")
+        for f in files:
+            self.file_entries.append((f, "file"))
+            self.file_list.insert(tk.END, f"[F] {f}")
 
-            for d in dirs:
-                entries.append((d, "dir"))
-                file_list.insert(tk.END, f"[D] {d}")
-            for f in files:
-                entries.append((f, "file"))
-                file_list.insert(tk.END, f"[F] {f}")
+    def open_selected_file(self, event=None):
+        sel = self.file_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        name, kind = self.file_entries[idx]
+        curdir = os.path.abspath(self.path_var.get())
+        if kind == "file":
+            self.open_dxd_panel(os.path.join(curdir, name))
+        elif kind in ("dir", "up"):
+            if kind == "up":
+                newdir = os.path.dirname(curdir)
+            else:
+                newdir = os.path.join(curdir, name)
+            self.path_var.set(newdir)
+            self.refresh_file_list()
 
-        path_entry.bind("<Return>", refresh_path)
-        refresh_file_list()
+    # -------------------------------------------------
+    # Sol alt kontrol paneli (kanal + trigger + karşılaştırma)
+    # -------------------------------------------------
+    def _build_control_panel(self, parent):
+        lf = ttk.LabelFrame(parent, text="DXD Kontrolleri")
+        lf.pack(fill="both", expand=True, padx=5, pady=5)
 
-        def open_selected_file():
-            sel = file_list.curselection()
-            if not sel:
-                return
-            idx = sel[0]
-            name, kind = entries[idx]
-            curdir = os.path.abspath(path_var.get())
-            if kind == "file":
-                ViewerWindow(self, os.path.join(curdir, name))
-            elif kind in ("dir", "up"):
-                if kind == "up":
-                    newdir = os.path.dirname(curdir)
-                else:
-                    newdir = os.path.join(curdir, name)
-                path_var.set(newdir)
-                refresh_file_list()
+        # Aktif dosya etiketi
+        row0 = ttk.Frame(lf)
+        row0.pack(fill="x", pady=2)
+        ttk.Label(row0, text="Aktif Dosya:").pack(side="left")
+        self.ctrl_file_label = ttk.Label(row0, text="(yok)", foreground="#808080")
+        self.ctrl_file_label.pack(side="left", padx=5)
 
-        file_list.bind("<Double-1>", lambda e: open_selected_file())
-        file_list.bind("<Return>", lambda e: open_selected_file())
+        # Kanal seçimi
+        row1 = ttk.Frame(lf)
+        row1.pack(fill="x", pady=2)
+        ttk.Label(row1, text="Kanal:").pack(side="left")
+        self.ctrl_channel_var = tk.StringVar()
+        self.ctrl_channel_combo = ttk.Combobox(
+            row1, textvariable=self.ctrl_channel_var, state="disabled", width=30
+        )
+        self.ctrl_channel_combo.pack(side="left", padx=5, fill="x", expand=True)
+        self.ctrl_channel_combo.bind("<<ComboboxSelected>>", self.on_channel_changed)
 
-        bottom = ttk.Frame(win)
-        bottom.pack(side="bottom", fill="x", pady=5)
+        # Trigger frame
+        trig = ttk.LabelFrame(lf, text="Trigger")
+        trig.pack(fill="x", pady=5)
 
-        ttk.Button(bottom, text="Aç", command=open_selected_file).pack(side="right", padx=5)
-        ttk.Button(bottom, text="İptal", command=win.destroy).pack(side="right")
+        self.ctrl_rising_var = tk.DoubleVar(value=10.0)
+        self.ctrl_falling_var = tk.DoubleVar(value=18.0)
+        self.ctrl_pad_var = tk.DoubleVar(value=1.0)
+
+        ttk.Label(trig, text="Rising >").grid(row=0, column=0, sticky="w")
+        self.ctrl_rising_entry = ttk.Entry(trig, textvariable=self.ctrl_rising_var, width=7, state="disabled")
+        self.ctrl_rising_entry.grid(row=0, column=1, padx=2)
+
+        ttk.Label(trig, text="Falling <").grid(row=1, column=0, sticky="w")
+        self.ctrl_falling_entry = ttk.Entry(trig, textvariable=self.ctrl_falling_var, width=7, state="disabled")
+        self.ctrl_falling_entry.grid(row=1, column=1, padx=2)
+
+        ttk.Label(trig, text="Pad (s)").grid(row=2, column=0, sticky="w")
+        self.ctrl_pad_entry = ttk.Entry(trig, textvariable=self.ctrl_pad_var, width=7, state="disabled")
+        self.ctrl_pad_entry.grid(row=2, column=1, padx=2)
+
+        # Butonlar
+        row_btn = ttk.Frame(lf)
+        row_btn.pack(fill="x", pady=5)
+
+        self.ctrl_apply_btn = ttk.Button(
+            row_btn, text="Uygula", command=self.on_apply_trigger, state="disabled"
+        )
+        self.ctrl_apply_btn.pack(side="left", padx=2)
+
+        self.ctrl_compare_btn = ttk.Button(
+            row_btn, text="Karşılaştırma Panelini Aç",
+            command=self.ensure_compare_panel, state="disabled"
+        )
+        self.ctrl_compare_btn.pack(side="left", padx=2)
+
+    def set_control_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        self.ctrl_channel_combo.configure(state=("readonly" if enabled else "disabled"))
+        self.ctrl_rising_entry.configure(state=state)
+        self.ctrl_falling_entry.configure(state=state)
+        self.ctrl_pad_entry.configure(state=state)
+        self.ctrl_apply_btn.configure(state=state)
+        self.ctrl_compare_btn.configure(state=state)
+
+    def set_active_panel(self, panel):
+        # Sadece ViewerPanel için kontrol bağlayalım
+        if isinstance(panel, ViewerPanel):
+            self.active_panel = panel
+            self.ctrl_file_label.configure(
+                text=os.path.basename(panel.filepath),
+                foreground="black"
+            )
+            channels = panel.get_channels()
+            self.ctrl_channel_combo["values"] = channels
+            self.ctrl_channel_var.set("")  # başlangıçta boş, kullanıcı seçecek
+            self.set_control_enabled(bool(channels))
+        else:
+            self.active_panel = None
+            self.ctrl_file_label.configure(text="(yok)", foreground="#808080")
+            self.ctrl_channel_combo["values"] = []
+            self.ctrl_channel_var.set("")
+            self.set_control_enabled(False)
+
+    def on_channel_changed(self, event=None):
+        if self.active_panel is None:
+            return
+        chan = self.ctrl_channel_var.get()
+        if not chan:
+            return
+        try:
+            r = float(self.ctrl_rising_var.get())
+            f = float(self.ctrl_falling_var.get())
+            p = float(self.ctrl_pad_var.get())
+        except ValueError:
+            messagebox.showwarning("Trigger", "Trigger değerleri sayısal olmalı.")
+            return
+
+        self.active_panel.plot_channel(chan, r, f, p, apply_trigger=True)
+
+    def on_apply_trigger(self):
+        if self.active_panel is None:
+            return
+        chan = self.ctrl_channel_var.get()
+        if not chan:
+            messagebox.showwarning("Kanal", "Önce bir kanal seçin.")
+            return
+        try:
+            r = float(self.ctrl_rising_var.get())
+            f = float(self.ctrl_falling_var.get())
+            p = float(self.ctrl_pad_var.get())
+        except ValueError:
+            messagebox.showwarning("Trigger", "Trigger değerleri sayısal olmalı.")
+            return
+
+        self.active_panel.plot_channel(chan, r, f, p, apply_trigger=True)
+
+    # -------------------------------------------------
+    # Karşılaştırma paneli yönetimi
+    # -------------------------------------------------
+    def ensure_compare_panel(self):
+        if self.compare_panel is None or not self._panel_exists(self.compare_panel):
+            self.compare_panel = ComparePanel(self.workspace_canvas, self)
+            self._create_panel_window(self.compare_panel, width=800, height=350)
+        entry = self._find_panel_entry(self.compare_panel)
+        if entry is not None:
+            self.workspace_canvas.tag_raise(entry["win_id"])
+        return self.compare_panel
+
+    # -------------------------------------------------
+    # Panel yönetim yardımcıları
+    # -------------------------------------------------
+    def _find_panel_entry(self, panel):
+        for entry in self.panels:
+            if entry["panel"] is panel:
+                return entry
+        return None
+
+    def _panel_exists(self, panel):
+        return self._find_panel_entry(panel) is not None
+
+    def close_panel(self, panel):
+        entry = self._find_panel_entry(panel)
+        if entry:
+            self.workspace_canvas.delete(entry["win_id"])
+            self.panels.remove(entry)
+        if panel is self.compare_panel:
+            self.compare_panel = None
+        if panel is self.active_panel:
+            self.set_active_panel(None)
+        panel.destroy()
+
+    # ---- hareket (canvas dışına taşmayı engelle) ----
+    def start_move_panel(self, panel, event):
+        entry = self._find_panel_entry(panel)
+        if entry is None:
+            return
+        self._drag_state = {
+            "mode": "move",
+            "entry": entry,
+            "start_x_root": event.x_root,
+            "start_y_root": event.y_root,
+            "orig_x": entry["x"],
+            "orig_y": entry["y"],
+        }
+
+    def drag_move_panel(self, panel, event):
+        if not self._drag_state or self._drag_state.get("mode") != "move":
+            return
+        if self._drag_state["entry"]["panel"] is not panel:
+            return
+
+        dx = event.x_root - self._drag_state["start_x_root"]
+        dy = event.y_root - self._drag_state["start_y_root"]
+
+        entry = self._drag_state["entry"]
+        new_x = self._drag_state["orig_x"] + dx
+        new_y = self._drag_state["orig_y"] + dy
+
+        # Canvas sınırında tut
+        cw = self.workspace_canvas.winfo_width()
+        ch = self.workspace_canvas.winfo_height()
+        if cw > 10 and ch > 10:
+            max_x = max(0, cw - entry["w"])
+            max_y = max(0, ch - entry["h"])
+            new_x = min(max(0, new_x), max_x)
+            new_y = min(max(0, new_y), max_y)
+
+        entry["x"] = new_x
+        entry["y"] = new_y
+        self.workspace_canvas.coords(entry["win_id"], new_x, new_y)
+
+    def end_move_panel(self, panel, event):
+        if self._drag_state and self._drag_state.get("mode") == "move":
+            self._drag_state = None
+
+    # ---- yeniden boyutlandırma (canvas dışına taşmayı engelle) ----
+    def start_resize_panel(self, panel, event):
+        entry = self._find_panel_entry(panel)
+        if entry is None:
+            return
+        self._drag_state = {
+            "mode": "resize",
+            "entry": entry,
+            "start_x_root": event.x_root,
+            "start_y_root": event.y_root,
+            "orig_w": entry["w"],
+            "orig_h": entry["h"],
+        }
+
+    def drag_resize_panel(self, panel, event):
+        if not self._drag_state or self._drag_state.get("mode") != "resize":
+            return
+        if self._drag_state["entry"]["panel"] is not panel:
+            return
+
+        dx = event.x_root - self._drag_state["start_x_root"]
+        dy = event.y_root - self._drag_state["start_y_root"]
+
+        entry = self._drag_state["entry"]
+
+        new_w = max(400, self._drag_state["orig_w"] + dx)
+        new_h = max(250, self._drag_state["orig_h"] + dy)
+
+        # Canvas sınırı
+        cw = self.workspace_canvas.winfo_width()
+        ch = self.workspace_canvas.winfo_height()
+        if cw > 10 and ch > 10:
+            max_w = max(200, cw - entry["x"])
+            max_h = max(150, ch - entry["y"])
+            new_w = min(new_w, max_w)
+            new_h = min(new_h, max_h)
+
+        entry["w"] = new_w
+        entry["h"] = new_h
+
+        self.workspace_canvas.itemconfigure(entry["win_id"], width=new_w, height=new_h)
+        entry["panel"].configure(width=new_w, height=new_h)
+
+    def end_resize_panel(self, panel, event):
+        if self._drag_state and self._drag_state.get("mode") == "resize":
+            self._drag_state = None
 
 
 # =========================================================
