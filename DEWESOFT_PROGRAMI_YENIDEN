@@ -1,0 +1,698 @@
+import os
+import sys
+import string
+import csv
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import numpy as np
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+try:
+    import dwdatareader as dw
+except ImportError:
+    dw = None
+
+
+# =========================================================
+# Karşılaştırma Penceresi (ortak, çok segmentli)
+# =========================================================
+class CompareWindow(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Karşılaştırma Ekranı")
+        self.geometry("900x500")
+
+        self.segments = []  # her biri: {file, channel, seg_index, t_rel, y}
+
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True, padx=5, pady=5)
+
+        plot_frame = ttk.LabelFrame(main, text="Seçilen Bölgeler")
+        plot_frame.pack(fill="both", expand=True)
+
+        self.fig = Figure(figsize=(6, 4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.grid(True)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        bottom = ttk.Frame(main)
+        bottom.pack(fill="x", pady=5)
+
+        ttk.Button(bottom, text="Export CSV", command=self.export_csv).pack(side="right", padx=5)
+        ttk.Button(bottom, text="Temizle", command=self.clear_segments).pack(side="right", padx=5)
+
+        self.status_label = ttk.Label(bottom, text="Segment yok", anchor="w")
+        self.status_label.pack(side="left", padx=5, fill="x", expand=True)
+
+    def add_segment(self, t_full, y_full, t0, t1, chan_name, source_file):
+        # t0–t1 aralığını kes, zamanı 0'dan başlat
+        mask = (t_full >= t0) & (t_full <= t1)
+        if mask.sum() < 2:
+            return
+
+        t_seg = t_full[mask]
+        y_seg = y_full[mask]
+
+        t_rel = t_seg - t_seg[0]
+
+        seg_index = len(self.segments) + 1
+        seg = {
+            "file": source_file,
+            "channel": chan_name,
+            "seg_index": seg_index,
+            "t_rel": t_rel,
+            "y": y_seg,
+        }
+        self.segments.append(seg)
+
+        self._redraw()
+
+    def _redraw(self):
+        self.ax.clear()
+        self.ax.grid(True)
+
+        if not self.segments:
+            self.ax.set_title("Henüz segment seçilmedi")
+            self.canvas.draw()
+            self.status_label.config(text="Segment yok")
+            return
+
+        colors = ["C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"]
+
+        for i, seg in enumerate(self.segments):
+            c = colors[i % len(colors)]
+            t_rel = seg["t_rel"]
+            y = seg["y"]
+            label = f"{os.path.basename(seg['file'])} | {seg['channel']} | #{seg['seg_index']}"
+            self.ax.plot(t_rel, y, label=label, color=c)
+
+        self.ax.set_xlabel("Zaman (s) (segmente göre)")
+        self.ax.set_ylabel("Değer")
+        self.ax.set_title("Seçilen turuncu bölgelerin karşılaştırması")
+        self.ax.legend()
+        self.canvas.draw()
+
+        self.status_label.config(text=f"{len(self.segments)} segment")
+
+    def clear_segments(self):
+        self.segments.clear()
+        self._redraw()
+
+    def export_csv(self):
+        if not self.segments:
+            messagebox.showwarning("Export", "Export edilecek segment yok.")
+            return
+
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        os.makedirs(desktop, exist_ok=True)
+        out_path = os.path.join(desktop, "DNASoftX_CompareExport.csv")
+
+        try:
+            with open(out_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow(["file", "channel", "segment_index",
+                                 "sample_index", "t_rel_s", "value"])
+
+                for seg in self.segments:
+                    file = seg["file"]
+                    channel = seg["channel"]
+                    seg_index = seg["seg_index"]
+                    t_rel = seg["t_rel"]
+                    y = seg["y"]
+                    for i in range(len(t_rel)):
+                        writer.writerow([
+                            file,
+                            channel,
+                            seg_index,
+                            i,
+                            float(t_rel[i]),
+                            float(y[i]),
+                        ])
+
+            messagebox.showinfo(
+                "Export tamam",
+                f"CSV dosyası oluşturuldu:\n{out_path}"
+            )
+        except Exception as e:
+            messagebox.showerror("Export hatası", str(e))
+
+
+# =========================================================
+# DXD Viewer (tek dosya, tek kanal + trigger + karşılaştırma)
+# =========================================================
+class ViewerWindow(tk.Toplevel):
+    """
+    Her DXD dosyası ayrı pencerede gösterilir.
+    - Tek kanal seçimi (Combobox)
+    - Rising / Falling / Pad ayarları
+    - Turuncu alanlarda trigger mantığı
+    - Turuncu alanı seçip Karşılaştırma ekranına segment ekleme
+    """
+    def __init__(self, master, filepath):
+        super().__init__(master)
+        self.title(f"DNASoft X - {os.path.basename(filepath)}")
+        self.geometry("1100x700")
+
+        self.master_app = master   # DxdViewerApp referansı
+        self.filepath = filepath
+        self.dwfile = None
+
+        # trigger değerleri
+        self.rising_val = tk.DoubleVar(value=10.0)
+        self.falling_val = tk.DoubleVar(value=18.0)
+        self.pad_sec = tk.DoubleVar(value=1.0)
+
+        # son çizilen veriyi ve aralıkları saklayalım
+        self.last_t = None
+        self.last_y = None
+        self.last_chan = None
+        self.intervals = []  # [(t0, t1), ...]
+
+        # drag seçim için
+        self._drag_interval_index = None
+
+        self._build_ui()
+        self._open_file()
+
+    def _build_ui(self):
+        # Kanal + trigger paneli
+        top = ttk.Frame(self)
+        top.pack(fill="x", pady=5)
+
+        ttk.Label(top, text="Kanal:").pack(side="left")
+        self.channel_combo = ttk.Combobox(top, state="readonly", width=40)
+        self.channel_combo.pack(side="left", padx=5)
+        self.channel_combo.bind("<<ComboboxSelected>>", lambda e: self._update_plot())
+
+        trig = ttk.LabelFrame(top, text="Trigger")
+        trig.pack(side="left", padx=10)
+
+        ttk.Label(trig, text="Rising >").grid(row=0, column=0, sticky="w")
+        ttk.Entry(trig, textvariable=self.rising_val, width=6).grid(row=0, column=1, padx=2)
+
+        ttk.Label(trig, text="Falling <").grid(row=1, column=0, sticky="w")
+        ttk.Entry(trig, textvariable=self.falling_val, width=6).grid(row=1, column=1, padx=2)
+
+        ttk.Label(trig, text="Pad (s)").grid(row=2, column=0, sticky="w")
+        ttk.Entry(trig, textvariable=self.pad_sec, width=6).grid(row=2, column=1, padx=2)
+
+        ttk.Button(trig, text="Uygula", command=self._update_plot)\
+            .grid(row=3, column=0, columnspan=2, pady=3, sticky="we")
+
+        ttk.Button(trig, text="Karşılaştırma Ekranı Aç",
+                   command=self.open_compare_window)\
+            .grid(row=4, column=0, columnspan=2, pady=3, sticky="we")
+
+        # Grafik
+        plot = ttk.LabelFrame(self, text="Grafik")
+        plot.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.fig = Figure(figsize=(6, 4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.grid(True)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot)
+        self.canvas_widget = self.canvas.get_tk_widget()
+        self.canvas_widget.pack(fill="both", expand=True)
+
+        # Turuncu alan seçimi için matplotlib event'leri
+        self.canvas.mpl_connect("button_press_event", self.on_press)
+        self.canvas.mpl_connect("button_release_event", self.on_release)
+
+    def open_compare_window(self):
+        self.master_app.ensure_compare_window()
+
+    def _open_file(self):
+        try:
+            self.dwfile = dw.DWFile(self.filepath)
+            chan_names = sorted(list(self.dwfile.keys()))
+            self.channel_combo["values"] = chan_names
+            if chan_names:
+                self.channel_combo.current(0)
+                self._update_plot()
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+
+    # -------------------------------------------------
+    # Trigger mantığı + turuncu alan çizimi
+    # -------------------------------------------------
+    def _update_plot(self):
+        self.ax.clear()
+        self.intervals = []
+        self.last_t = None
+        self.last_y = None
+        self.last_chan = None
+
+        chan = self.channel_combo.get()
+        if not chan:
+            self.ax.set_title("Kanal seçilmedi")
+            self.canvas.draw()
+            return
+
+        s = self.dwfile[chan].series()
+        if s is None or s.empty:
+            self.ax.set_title("Veri boş")
+            self.canvas.draw()
+            return
+
+        t = s.index.to_numpy()
+        y = s.to_numpy(dtype=float)
+
+        self.last_t = t
+        self.last_y = y
+        self.last_chan = chan
+
+        # Ana eğri
+        self.ax.plot(t, y, label=chan)
+
+        rising = float(self.rising_val.get())
+        falling = float(self.falling_val.get())
+        pad = float(self.pad_sec.get())
+
+        intervals = []
+
+        if falling < rising:
+            falling = rising
+
+        if abs(falling - rising) < 1e-9:
+            # Tek eşik
+            thr = rising
+            state = "below"
+            t_start = None
+
+            for i in range(len(y) - 1):
+                y0, y1 = y[i], y[i+1]
+                t1 = t[i+1]
+
+                if state == "below":
+                    if (y0 < thr) and (y1 >= thr):
+                        t_start = t1
+                        state = "above"
+
+                elif state == "above":
+                    if (y0 > thr) and (y1 <= thr):
+                        t_end = t1
+                        intervals.append((t_start, t_end))
+                        state = "below"
+                        t_start = None
+        else:
+            # Çift eşik: rising < falling
+            low = rising
+            high = falling
+
+            state = "waiting_rise"
+            t_start = None
+            seen_high = False
+
+            for i in range(len(y) - 1):
+                y0, y1 = y[i], y[i+1]
+                t0, t1 = t[i], t[i+1]
+
+                if state == "waiting_rise":
+                    if (y0 < low) and (y1 >= low):
+                        t_start = t1
+                        state = "above_low"
+                        seen_high = False
+
+                elif state == "above_low":
+                    # 10'un altına düşersek reset
+                    if (y0 >= low) and (y1 < low):
+                        state = "waiting_rise"
+                        t_start = None
+                        seen_high = False
+                        continue
+
+                    # 20'nin üzerine ilk kez çıkma
+                    if (not seen_high) and (y0 < high) and (y1 >= high):
+                        seen_high = True
+
+                    # 20'nin üstünden 20'nin altına iniş → falling edge
+                    if seen_high and (y0 > high) and (y1 <= high):
+                        t_end = t1
+                        intervals.append((t_start, t_end))
+                        state = "waiting_rise"
+                        t_start = None
+                        seen_high = False
+
+        # Bulunan aralıkları çiz
+        for (t0, t1) in intervals:
+            start = max(t0 - pad, t[0])
+            end = min(t1 + pad, t[-1])
+
+            self.ax.axvspan(start, end, color="orange", alpha=0.3)
+            self.ax.axvline(t0, color="green", linestyle="--", alpha=0.8)
+            self.ax.axvline(t1, color="red", linestyle="--", alpha=0.8)
+
+        self.intervals = intervals
+
+        self.ax.set_title(chan)
+        self.ax.legend()
+        self.ax.grid(True)
+        self.canvas.draw()
+
+    # -------------------------------------------------
+    # Turuncu alan seçimi (click & drag)
+    # -------------------------------------------------
+    def on_press(self, event):
+        if event.inaxes != self.ax or event.xdata is None:
+            self._drag_interval_index = None
+            return
+
+        x = event.xdata
+        idx = None
+        for i, (t0, t1) in enumerate(self.intervals):
+            if t0 <= x <= t1:
+                idx = i
+                break
+
+        self._drag_interval_index = idx
+
+    def on_release(self, event):
+        if self._drag_interval_index is None:
+            return
+
+        # Karşılaştırma penceresi yoksa hiç uğraşma
+        compare_win = self.master_app.ensure_compare_window()
+        if compare_win is None:
+            self._drag_interval_index = None
+            return
+
+        if self.last_t is None or self.last_y is None or self.last_chan is None:
+            self._drag_interval_index = None
+            return
+
+        t0, t1 = self.intervals[self._drag_interval_index]
+        compare_win.add_segment(self.last_t, self.last_y, t0, t1,
+                                self.last_chan, self.filepath)
+
+        self._drag_interval_index = None
+
+
+# =========================================================
+# Ana Uygulama: Launcher + Splash + Dahili Explorer
+# =========================================================
+class DxdViewerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("DNASoft X - DXD Launcher")
+        self.geometry("800x200")
+        self.last_folder = os.getcwd()
+
+        self.compare_window = None  # ortak karşılaştırma penceresi
+
+        if dw is None:
+            messagebox.showerror(
+                "dwdatareader yok",
+                "dwdatareader modülü bulunamadı.\n\n"
+                "Kurmak için:\n    pip install dwdatareader\n"
+            )
+
+        self._build_ui()
+        self.withdraw()
+        self.after(0, self.show_splash)
+
+    def ensure_compare_window(self):
+        if self.compare_window is None or not tk.Toplevel.winfo_exists(self.compare_window):
+            self.compare_window = CompareWindow(self)
+        return self.compare_window
+
+    # --- Splash ekranı ---
+    def show_splash(self):
+        splash = tk.Toplevel(self)
+        splash.overrideredirect(True)
+
+        w, h = 700, 400
+        sw = splash.winfo_screenwidth()
+        sh = splash.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        splash.geometry(f"{w}x{h}+{x}+{y}")
+
+        canvas = tk.Canvas(splash, width=w, height=h, highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+
+        try:
+            base_dir = os.path.dirname(sys.argv[0])
+            img_path = os.path.join(base_dir, "splash_bg.png")
+            if os.path.exists(img_path):
+                bg_image = tk.PhotoImage(file=img_path)
+                canvas.bg_image = bg_image
+                canvas.create_image(w // 2, h // 2, image=bg_image)
+            else:
+                canvas.configure(bg="#202020")
+        except Exception:
+            canvas.configure(bg="#202020")
+
+        canvas.create_text(10, 10, anchor="nw",
+                           text="https://validasyon.tumosan.com.tr:3000/",
+                           fill="#c0c0c0", font=("Segoe UI", 9))
+        canvas.create_text(w - 10, 10, anchor="ne",
+                           text="Copyright 2025 - 2025 Tümosan. Tüm hakları saklıdır.",
+                           fill="#c0c0c0", font=("Segoe UI", 9))
+
+        canvas.create_text(w // 2, h // 2 - 40, anchor="center",
+                           text="DNASoft X",
+                           fill="white", font=("Segoe UI", 32, "bold"))
+        canvas.create_text(w // 2, h // 2 + 5, anchor="center",
+                           text="YENİ YILIN KUTLU OLSUN ALİ CAN",
+                           fill="#e0e0e0", font=("Segoe UI", 14))
+
+        canvas.create_text(20, h - 35, anchor="w",
+                           text="DEV-251230",
+                           fill="#909090", font=("Segoe UI", 10))
+        load_text = canvas.create_text(w - 20, h - 35, anchor="e",
+                                       text="loading exe...",
+                                       fill="#c0c0c0", font=("Segoe UI", 10))
+
+        margin = 60
+        bar_y1 = h - 25
+        bar_y2 = h - 15
+        canvas.create_rectangle(margin, bar_y1, w - margin, bar_y2,
+                                fill="#404040", outline="")
+        bar_fg = canvas.create_rectangle(margin, bar_y1, margin, bar_y2,
+                                         fill="#b0b0b0", outline="")
+
+        duration_ms = 5000
+        interval_ms = 50
+        steps = duration_ms // interval_ms
+
+        messages = [
+            "loading exe...",
+            "loading dxd...",
+            "loading grafana...",
+            "loading CAN bus...",
+            "initializing plots...",
+            "starting DNASoft X..."
+        ]
+        msg_count = len(messages)
+        msg_step = max(1, steps // msg_count)
+
+        def update_progress(step=0):
+            if step > steps:
+                splash.destroy()
+                self.deiconify()
+                return
+
+            progress = step / steps
+            total_width = (w - margin) - margin
+            x1 = margin + int(total_width * progress)
+            canvas.coords(bar_fg, margin, bar_y1, x1, bar_y2)
+
+            msg_index = min(msg_count - 1, step // msg_step)
+            canvas.itemconfig(load_text, text=messages[msg_index])
+
+            splash.after(interval_ms, lambda: update_progress(step + 1))
+
+        update_progress(0)
+
+    # --- Launcher UI ---
+    def _build_ui(self):
+        top = ttk.Frame(self)
+        top.pack(side="top", fill="x")
+
+        lbl = ttk.Label(top, text="DNASoft X - DXD Viewer Launcher", anchor="w")
+        lbl.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+
+        ttk.Button(top, text="DXD Dosyası Aç...", command=self.ask_open_file)\
+            .pack(side="right", padx=10, pady=5)
+
+    def _list_drives(self):
+        drives = []
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.exists(drive):
+                drives.append(drive)
+        return drives
+
+    def ask_open_file(self):
+        win = tk.Toplevel(self)
+        win.title("DXD Dosyası Seç")
+        win.geometry("900x500")
+
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=5, pady=5)
+
+        path_var = tk.StringVar(value=self.last_folder)
+
+        ttk.Label(top, text="Klasör:").pack(side="left")
+        path_entry = ttk.Entry(top, textvariable=path_var)
+        path_entry.pack(side="left", fill="x", expand=True, padx=5)
+
+        def refresh_path(event=None):
+            refresh_file_list()
+
+        ttk.Button(top, text="Git", command=refresh_path).pack(side="right")
+
+        middle = ttk.PanedWindow(win, orient="horizontal")
+        middle.pack(fill="both", expand=True, padx=5, pady=5)
+
+        drv_frame = ttk.Frame(middle, width=220)
+        middle.add(drv_frame, weight=1)
+
+        ttk.Label(drv_frame, text="Sürücüler / Kısayollar").pack(anchor="w")
+
+        drv_list = tk.Listbox(drv_frame, width=28)
+        drv_list.pack(side="left", fill="y", expand=False)
+
+        drv_scroll = ttk.Scrollbar(drv_frame, orient="vertical", command=drv_list.yview)
+        drv_scroll.pack(side="right", fill="y")
+        drv_list.config(yscrollcommand=drv_scroll.set)
+
+        file_frame = ttk.Frame(middle)
+        middle.add(file_frame, weight=3)
+
+        file_list = tk.Listbox(file_frame, width=60)
+        file_list.pack(side="left", fill="both", expand=True)
+
+        file_scroll = ttk.Scrollbar(file_frame, orient="vertical",
+                                    command=file_list.yview)
+        file_scroll.pack(side="right", fill="y")
+        file_list.config(yscrollcommand=file_scroll.set)
+
+        entries = []
+
+        def refresh_drives():
+            drv_list.delete(0, tk.END)
+            user_home = os.path.expanduser("~")
+            desktop = os.path.join(user_home, "Desktop")
+            projects = r"\\albil\tumosan\Tumosan_Ortak\Arge\Test_ve_Validasyon\11_Projeler"
+
+            drv_list.insert(tk.END, f"[K] Kullanıcı ({user_home})")
+            if os.path.isdir(desktop):
+                drv_list.insert(tk.END, f"[K] Desktop ({desktop})")
+            if os.path.isdir(projects):
+                drv_list.insert(tk.END, f"[K] 11_Projeler ({projects})")
+
+            for d in self._list_drives():
+                drv_list.insert(tk.END, f"[S] {d}")
+
+        refresh_drives()
+
+        def on_drive_activate(event=None):
+            sel = drv_list.curselection()
+            if not sel:
+                return
+            text = drv_list.get(sel[0])
+
+            if text.startswith("[K]"):
+                if "(" in text and text.endswith(")"):
+                    base = text[text.index("(") + 1:-1]
+                else:
+                    return
+                target = base
+            elif text.startswith("[S]"):
+                parts = text.split()
+                target = parts[1]
+            else:
+                return
+
+            if os.path.isdir(target):
+                path_var.set(target)
+                refresh_file_list()
+
+        drv_list.bind("<Double-1>", on_drive_activate)
+        drv_list.bind("<Return>", on_drive_activate)
+
+        def refresh_file_list():
+            nonlocal entries
+            folder = os.path.abspath(path_var.get())
+            if not os.path.isdir(folder):
+                messagebox.showwarning("Klasör yok", folder)
+                return
+
+            path_var.set(folder)
+            self.last_folder = folder
+
+            file_list.delete(0, tk.END)
+            entries = []
+
+            parent = os.path.dirname(folder)
+            if parent and parent != folder:
+                entries.append(("..", "up"))
+                file_list.insert(tk.END, "[..] Üst Klasör")
+
+            try:
+                all_items = os.listdir(folder)
+            except PermissionError:
+                messagebox.showwarning("Erişim yok", folder)
+                return
+
+            dirs = []
+            files = []
+
+            for name in all_items:
+                full = os.path.join(folder, name)
+                if os.path.isdir(full):
+                    dirs.append(name)
+                elif name.lower().endswith(".dxd") or name.lower().endswith(".d7d"):
+                    files.append(name)
+
+            dirs.sort()
+            files.sort()
+
+            for d in dirs:
+                entries.append((d, "dir"))
+                file_list.insert(tk.END, f"[D] {d}")
+            for f in files:
+                entries.append((f, "file"))
+                file_list.insert(tk.END, f"[F] {f}")
+
+        path_entry.bind("<Return>", refresh_path)
+        refresh_file_list()
+
+        def open_selected_file():
+            sel = file_list.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            name, kind = entries[idx]
+            curdir = os.path.abspath(path_var.get())
+            if kind == "file":
+                ViewerWindow(self, os.path.join(curdir, name))
+            elif kind in ("dir", "up"):
+                if kind == "up":
+                    newdir = os.path.dirname(curdir)
+                else:
+                    newdir = os.path.join(curdir, name)
+                path_var.set(newdir)
+                refresh_file_list()
+
+        file_list.bind("<Double-1>", lambda e: open_selected_file())
+        file_list.bind("<Return>", lambda e: open_selected_file())
+
+        bottom = ttk.Frame(win)
+        bottom.pack(side="bottom", fill="x", pady=5)
+
+        ttk.Button(bottom, text="Aç", command=open_selected_file).pack(side="right", padx=5)
+        ttk.Button(bottom, text="İptal", command=win.destroy).pack(side="right")
+
+
+# =========================================================
+if __name__ == "__main__":
+    app = DxdViewerApp()
+    app.mainloop()
