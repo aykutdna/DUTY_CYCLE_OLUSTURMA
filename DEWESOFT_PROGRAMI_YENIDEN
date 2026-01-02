@@ -2,6 +2,7 @@ import os
 import sys
 import string
 import csv
+import math
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -17,13 +18,13 @@ except ImportError:
 
 
 # =========================================================
-# Ortak: Hareketli / yeniden boyutlandırılabilir panel sınıfı
+# Temel: Hareketli / Yeniden Boyutlandırılabilir Panel
 # =========================================================
 class MovablePanel(ttk.Frame):
     """
     Sağ taraftaki çalışma alanında yer alan tüm paneller için temel sınıf:
     - Başlık çubuğundan sürükleyerek taşıma
-    - Sağ alt köşedeki grip ile yeniden boyutlandırma
+    - Sağ alttaki sizegrip ile yeniden boyutlandırma
     - X butonu ile panel kapama
     """
     def __init__(self, master_canvas, app, title="Panel"):
@@ -38,8 +39,7 @@ class MovablePanel(ttk.Frame):
         self.title_label = ttk.Label(header, text=title, anchor="w")
         self.title_label.pack(side="left", padx=4)
 
-        close_btn = ttk.Button(header, text="X", width=2,
-                               command=self._on_close)
+        close_btn = ttk.Button(header, text="X", width=2, command=self._on_close)
         close_btn.pack(side="right", padx=2)
 
         for w in (header, self.title_label):
@@ -47,7 +47,7 @@ class MovablePanel(ttk.Frame):
             w.bind("<B1-Motion>", self._on_header_drag)
             w.bind("<ButtonRelease-1>", self._on_header_release)
 
-        # --- Alt kısım: resize grip ---
+        # --- Alt kısım / resize grip ---
         bottom_bar = ttk.Frame(self)
         bottom_bar.pack(side="bottom", fill="x")
         self.size_grip = ttk.Sizegrip(bottom_bar)
@@ -58,7 +58,7 @@ class MovablePanel(ttk.Frame):
             w.bind("<B1-Motion>", self._on_resize_drag)
             w.bind("<ButtonRelease-1>", self._on_resize_release)
 
-    # ---- header drag delegasyonları ----
+    # --- header drag delegasyonları ---
     def _on_header_press(self, event):
         self.app.set_active_panel(self)
         self.app.start_move_panel(self, event)
@@ -69,7 +69,7 @@ class MovablePanel(ttk.Frame):
     def _on_header_release(self, event):
         self.app.end_move_panel(self, event)
 
-    # ---- resize delegasyonları ----
+    # --- resize delegasyonları ---
     def _on_resize_press(self, event):
         self.app.set_active_panel(self)
         self.app.start_resize_panel(self, event)
@@ -80,18 +80,21 @@ class MovablePanel(ttk.Frame):
     def _on_resize_release(self, event):
         self.app.end_resize_panel(self, event)
 
-    # ---- kapatma ----
+    # --- kapama ---
     def _on_close(self):
         self.app.close_panel(self)
 
 
 # =========================================================
-# Karşılaştırma Paneli (çok segmentli, ortak)
+# Karşılaştırma Paneli
 # =========================================================
 class ComparePanel(MovablePanel):
+    """
+    Farklı DXD'lerden seçilen turuncu segmentleri tek grafikte kıyaslar.
+    """
     def __init__(self, master_canvas, app):
         super().__init__(master_canvas, app, title="Karşılaştırma")
-        self.segments = []  # her biri: {file, channel, seg_index, t_rel, y}
+        self.segments = []  # {file, channel, seg_index, t_rel, y}
 
         main = ttk.Frame(self)
         main.pack(fill="both", expand=True, padx=5, pady=5)
@@ -99,12 +102,10 @@ class ComparePanel(MovablePanel):
         plot_frame = ttk.LabelFrame(main, text="Seçilen Bölgeler")
         plot_frame.pack(fill="both", expand=True)
 
-        # Şekil + Canvas
         self.fig = Figure(figsize=(6, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.grid(True)
 
-        # Toolbar üstte
         toolbar_frame = ttk.Frame(plot_frame)
         toolbar_frame.pack(side="top", fill="x")
 
@@ -118,21 +119,19 @@ class ComparePanel(MovablePanel):
         bottom = ttk.Frame(main)
         bottom.pack(fill="x", pady=5)
 
-        ttk.Button(bottom, text="Export CSV", command=self.export_csv).pack(side="right", padx=5)
         ttk.Button(bottom, text="Temizle", command=self.clear_segments).pack(side="right", padx=5)
+        ttk.Button(bottom, text="Export CSV", command=self.export_csv).pack(side="right", padx=5)
 
         self.status_label = ttk.Label(bottom, text="Segment yok", anchor="w")
         self.status_label.pack(side="left", padx=5, fill="x", expand=True)
 
     def add_segment(self, t_full, y_full, t0, t1, chan_name, source_file):
-        # t0–t1 aralığını kes, zamanı 0'dan başlat
         mask = (t_full >= t0) & (t_full <= t1)
         if mask.sum() < 2:
             return
 
         t_seg = t_full[mask]
         y_seg = y_full[mask]
-
         t_rel = t_seg - t_seg[0]
 
         seg_index = len(self.segments) + 1
@@ -144,7 +143,6 @@ class ComparePanel(MovablePanel):
             "y": y_seg,
         }
         self.segments.append(seg)
-
         self._redraw()
 
     def _redraw(self):
@@ -157,7 +155,7 @@ class ComparePanel(MovablePanel):
             self.status_label.config(text="Segment yok")
             return
 
-        colors = ["C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"]
+        colors = [f"C{i}" for i in range(10)]
 
         for i, seg in enumerate(self.segments):
             c = colors[i % len(colors)]
@@ -172,7 +170,6 @@ class ComparePanel(MovablePanel):
         self.ax.legend()
         self.canvas.draw()
         self.toolbar.update()
-
         self.status_label.config(text=f"{len(self.segments)} segment")
 
     def clear_segments(self):
@@ -190,9 +187,9 @@ class ComparePanel(MovablePanel):
 
         try:
             with open(out_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f, delimiter=";")
-                writer.writerow(["file", "channel", "segment_index",
-                                 "sample_index", "t_rel_s", "value"])
+                wr = csv.writer(f, delimiter=";")
+                wr.writerow(["file", "channel", "segment_index",
+                             "sample_index", "t_rel_s", "value"])
 
                 for seg in self.segments:
                     file = seg["file"]
@@ -201,7 +198,7 @@ class ComparePanel(MovablePanel):
                     t_rel = seg["t_rel"]
                     y = seg["y"]
                     for i in range(len(t_rel)):
-                        writer.writerow([
+                        wr.writerow([
                             file,
                             channel,
                             seg_index,
@@ -210,24 +207,21 @@ class ComparePanel(MovablePanel):
                             float(y[i]),
                         ])
 
-            messagebox.showinfo(
-                "Export tamam",
-                f"CSV dosyası oluşturuldu:\n{out_path}"
-            )
+            messagebox.showinfo("Export", f"CSV oluşturuldu:\n{out_path}")
         except Exception as e:
             messagebox.showerror("Export hatası", str(e))
 
 
 # =========================================================
-# DXD Viewer Paneli (sadece grafik + trigger mantığı)
+# DXD Viewer Paneli
 # =========================================================
 class ViewerPanel(MovablePanel):
     """
-    Her DXD dosyası sağ taraftaki çalışma alanında ayrı bir panel olarak gösterilir.
-    Bu panelde sadece:
-      - Başlık çubuğu (dosya adı)
-      - Grafik (Matplotlib + toolbar)
-    Kontrol (kanal seçimi, trigger vs.) sol alttaki sabit paneldedir.
+    Her DXD dosyası için:
+      - Tek bir grafik (matplotlib)
+      - Trigger ile turuncu bölgeleri işaretleme
+      - Segmentleri ComparePanel'e gönderme
+    Kontroller sol alttaki global panelden yapılır.
     """
     def __init__(self, master_canvas, app, filepath):
         title = os.path.basename(filepath)
@@ -238,9 +232,10 @@ class ViewerPanel(MovablePanel):
         self.last_t = None
         self.last_y = None
         self.last_chan = None
-        self.intervals = []  # [(t0, t1), ...]
+        self.intervals = []  # [(t0, t1)]
 
-        # UI
+        self._drag_interval_index = None
+
         self._build_ui()
         self._load_file()
         self.show_blank()
@@ -252,25 +247,21 @@ class ViewerPanel(MovablePanel):
         plot = ttk.LabelFrame(content, text="Grafik")
         plot.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # Figure
         self.fig = Figure(figsize=(6, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.grid(True)
 
-        # Toolbar üstte
         toolbar_frame = ttk.Frame(plot)
         toolbar_frame.pack(side="top", fill="x")
 
-        # Canvas
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot)
         self.canvas_widget = self.canvas.get_tk_widget()
         self.canvas_widget.pack(side="top", fill="both", expand=True)
 
-        # Toolbar (zoom/pan/home/save vs.)
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
 
-        # Eventler
+        # Matplotlib eventler
         self.canvas.mpl_connect("button_press_event", self.on_press)
         self.canvas.mpl_connect("button_release_event", self.on_release)
 
@@ -299,10 +290,7 @@ class ViewerPanel(MovablePanel):
         self.toolbar.update()
 
     def plot_channel(self, chan, rising=None, falling=None, pad=0.0, apply_trigger=True):
-        if self.dwfile is None:
-            return
-
-        if not chan:
+        if self.dwfile is None or not chan:
             return
 
         try:
@@ -323,101 +311,95 @@ class ViewerPanel(MovablePanel):
         self.last_t = t
         self.last_y = y
         self.last_chan = chan
+        self.intervals = []
 
         self.ax.clear()
         self.ax.grid(True)
         self.ax.plot(t, y, label=chan)
 
-        intervals = []
-
         if apply_trigger and rising is not None:
-            # trigger hesap
-            r = float(rising)
-            f = float(falling) if falling is not None else r
-            p = float(pad) if pad is not None else 0.0
-
-            if f < r:
-                f = r
-
-            if abs(f - r) < 1e-9:
-                # Tek eşik
-                thr = r
-                state = "below"
-                t_start = None
-
-                for i in range(len(y) - 1):
-                    y0, y1 = y[i], y[i+1]
-                    t1 = t[i+1]
-
-                    if state == "below":
-                        if (y0 < thr) and (y1 >= thr):
-                            t_start = t1
-                            state = "above"
-
-                    elif state == "above":
-                        if (y0 > thr) and (y1 <= thr):
-                            t_end = t1
-                            intervals.append((t_start, t_end))
-                            state = "below"
-                            t_start = None
-            else:
-                # Çift eşik: rising < falling
-                low = r
-                high = f
-
-                state = "waiting_rise"
-                t_start = None
-                seen_high = False
-
-                for i in range(len(y) - 1):
-                    y0, y1 = y[i], y[i+1]
-                    t0, t1 = t[i], t[i+1]
-
-                    if state == "waiting_rise":
-                        if (y0 < low) and (y1 >= low):
-                            t_start = t1
-                            state = "above_low"
-                            seen_high = False
-
-                    elif state == "above_low":
-                        # low'un altına düşersek reset
-                        if (y0 >= low) and (y1 < low):
-                            state = "waiting_rise"
-                            t_start = None
-                            seen_high = False
-                            continue
-
-                        # high'ın üzerine ilk kez çıkma
-                        if (not seen_high) and (y0 < high) and (y1 >= high):
-                            seen_high = True
-
-                        # high'ın üstünden high'ın altına iniş → falling edge
-                        if seen_high and (y0 > high) and (y1 <= high):
-                            t_end = t1
-                            intervals.append((t_start, t_end))
-                            state = "waiting_rise"
-                            t_start = None
-                            seen_high = False
-
-            # Bulunan aralıkları çiz
-            for (t0, t1) in intervals:
-                start = max(t0 - p, t[0])
-                end = min(t1 + p, t[-1])
-
+            self.intervals = self._compute_intervals(t, y, rising, falling, pad)
+            for (t0, t1) in self.intervals:
+                start = max(t0 - pad, t[0])
+                end = min(t1 + pad, t[-1])
                 self.ax.axvspan(start, end, color="orange", alpha=0.3)
                 self.ax.axvline(t0, color="green", linestyle="--", alpha=0.8)
                 self.ax.axvline(t1, color="red", linestyle="--", alpha=0.8)
-
-        self.intervals = intervals
 
         self.ax.set_title(chan)
         self.ax.legend()
         self.canvas.draw()
         self.toolbar.update()
 
-    # -------------------------------------------------
-    # Turuncu alan seçimi (tıklayıp segment ekleme)
-    # -------------------------------------------------
+    @staticmethod
+    def _compute_intervals(t, y, rising, falling, pad):
+        intervals = []
+        r = float(rising)
+        f = float(falling) if falling is not None else r
+
+        if f < r:
+            f = r
+
+        if abs(f - r) < 1e-9:
+            # Tek eşik
+            thr = r
+            state = "below"
+            t_start = None
+
+            for i in range(len(y) - 1):
+                y0, y1 = y[i], y[i + 1]
+                t1 = t[i + 1]
+
+                if state == "below":
+                    if (y0 < thr) and (y1 >= thr):
+                        t_start = t1
+                        state = "above"
+
+                elif state == "above":
+                    if (y0 > thr) and (y1 <= thr):
+                        t_end = t1
+                        intervals.append((t_start, t_end))
+                        state = "below"
+                        t_start = None
+        else:
+            # Çift eşik: rising < falling
+            low = r
+            high = f
+
+            state = "waiting_rise"
+            t_start = None
+            seen_high = False
+
+            for i in range(len(y) - 1):
+                y0, y1 = y[i], y[i + 1]
+                t0, t1 = t[i], t[i + 1]
+
+                if state == "waiting_rise":
+                    if (y0 < low) and (y1 >= low):
+                        t_start = t1
+                        state = "above_low"
+                        seen_high = False
+
+                elif state == "above_low":
+                    if (y0 >= low) and (y1 < low):
+                        state = "waiting_rise"
+                        t_start = None
+                        seen_high = False
+                        continue
+
+                    if (not seen_high) and (y0 < high) and (y1 >= high):
+                        seen_high = True
+
+                    if seen_high and (y0 > high) and (y1 <= high):
+                        t_end = t1
+                        intervals.append((t_start, t_end))
+                        state = "waiting_rise"
+                        t_start = None
+                        seen_high = False
+
+        return intervals
+
+    # --- turuncu alan seçimi (segment ComparePanel'e) ---
     def on_press(self, event):
         self.app.set_active_panel(self)
         if event.inaxes != self.ax or event.xdata is None:
@@ -454,36 +436,37 @@ class ViewerPanel(MovablePanel):
 
 
 # =========================================================
-# Ana Uygulama: Tek pencere + sol gezgin + alt kontroller + sağ çalışma alanı
+# Ana Uygulama
 # =========================================================
 class DxdViewerApp(tk.Tk):
+    """
+    DNASoft X - Measurement UI tarzı Python arayüzü
+    - Sol: iç dosya gezgini + kontrol paneli
+    - Sağ: çoklu grafik panelleri (organize edilebilir)
+    """
     def __init__(self):
         super().__init__()
-        self.title("DNASoft X - DXD Viewer")
+        self.title("DNASoft X - DXD Viewer (Python)")
         self.geometry("1400x800")
         self.last_folder = os.getcwd()
 
         if dw is None:
             messagebox.showerror(
                 "dwdatareader yok",
-                "dwdatareader modülü bulunamadı.\n\n"
-                "Kurmak için:\n    pip install dwdatareader\n"
+                "dwdatareader modülü bulunamadı.\n\npip install dwdatareader"
             )
 
-        # panel yönetimi (sağ taraftaki çalışma alanında)
-        self.panels = []  # {panel, win_id, x, y, w, h}
+        self.panels = []        # {panel, win_id, x, y, w, h}
         self.compare_panel = None
         self.active_panel = None
-
-        self._drag_state = None  # move/resize state
+        self._drag_state = None
+        self.auto_layout = True
+        self.panel_offset = 0
 
         self._build_shell()
 
-    # -------------------------------------------------
-    # Ana layout
-    # -------------------------------------------------
+    # --- Shell Layout ---
     def _build_shell(self):
-        # Üst başlık
         top_bar = ttk.Frame(self)
         top_bar.pack(side="top", fill="x")
 
@@ -494,24 +477,18 @@ class DxdViewerApp(tk.Tk):
             font=("Segoe UI", 11, "bold"),
         ).pack(side="left", padx=10, pady=5, fill="x", expand=True)
 
-        # Ana bölücü
         main_pane = ttk.PanedWindow(self, orient="horizontal")
         main_pane.pack(fill="both", expand=True)
 
-        # Sol: Dosya gezgini + alt kontrol paneli
         left_frame = ttk.Frame(main_pane, width=350)
         main_pane.add(left_frame, weight=0)
 
-        # Sağ: Çalışma alanı
         right_frame = ttk.Frame(main_pane)
         main_pane.add(right_frame, weight=1)
 
         self._build_left_side(left_frame)
         self._build_workspace(right_frame)
 
-    # -------------------------------------------------
-    # Sol taraf: üstte gezgin, altta kontrol paneli
-    # -------------------------------------------------
     def _build_left_side(self, parent):
         vpaned = ttk.PanedWindow(parent, orient="vertical")
         vpaned.pack(fill="both", expand=True)
@@ -525,16 +502,22 @@ class DxdViewerApp(tk.Tk):
         self._build_file_explorer(explorer_frame)
         self._build_control_panel(control_frame)
 
-    # -------------------------------------------------
-    # Çalışma alanı (sağ)
-    # -------------------------------------------------
+    # --- Sağ taraf / Workspace ---
     def _build_workspace(self, parent):
-        self.workspace_canvas = tk.Canvas(parent, background="#202020")
-        self.workspace_canvas.pack(fill="both", expand=True)
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(side="top", fill="x")
 
-        self.panel_offset = 0
+        ttk.Button(toolbar, text="Organize et", command=self.organize_panels)\
+            .pack(side="left", padx=5, pady=3)
+
+        ttk.Button(toolbar, text="Export CSV", command=self.global_export_csv)\
+            .pack(side="left", padx=5, pady=3)
+
+        self.workspace_canvas = tk.Canvas(parent, background="#202020")
+        self.workspace_canvas.pack(side="top", fill="both", expand=True)
 
     def _create_panel_window(self, panel, width=700, height=400):
+        # Cascade default (auto_layout kapalıyken veya ComparePanel için)
         x = 20 + (self.panel_offset * 30)
         y = 20 + (self.panel_offset * 30)
         self.panel_offset += 1
@@ -544,30 +527,21 @@ class DxdViewerApp(tk.Tk):
         )
 
         self.panels.append(
-            {
-                "panel": panel,
-                "win_id": win_id,
-                "x": x,
-                "y": y,
-                "w": width,
-                "h": height,
-            }
+            {"panel": panel, "win_id": win_id, "x": x, "y": y, "w": width, "h": height}
         )
 
     def open_dxd_panel(self, filepath):
         panel = ViewerPanel(self.workspace_canvas, self, filepath)
         self._create_panel_window(panel)
+        if self.auto_layout:
+            self.organize_panels()
         self.set_active_panel(panel)
 
-    # -------------------------------------------------
-    # Sol iç dosya gezgini
-    # -------------------------------------------------
+    # --- Sol: Dosya Gezgini ---
     def _build_file_explorer(self, parent):
-        # Başlık
-        title = ttk.Label(parent, text="Dosya Gezgini (DXD / D7D)", font=("Segoe UI", 10, "bold"))
-        title.pack(anchor="w", padx=5, pady=5)
+        ttk.Label(parent, text="Dosya Gezgini (DXD/D7D)", font=("Segoe UI", 10, "bold"))\
+            .pack(anchor="w", padx=5, pady=5)
 
-        # Klasör yolu
         path_frame = ttk.Frame(parent)
         path_frame.pack(fill="x", padx=5, pady=2)
 
@@ -577,15 +551,13 @@ class DxdViewerApp(tk.Tk):
         path_entry = ttk.Entry(path_frame, textvariable=self.path_var)
         path_entry.pack(side="left", fill="x", expand=True, padx=5)
 
-        ttk.Button(path_frame, text="Git", command=self.refresh_file_list).pack(side="right")
-
+        ttk.Button(path_frame, text="Git", command=self.refresh_file_list)\
+            .pack(side="right")
         path_entry.bind("<Return>", lambda e: self.refresh_file_list())
 
-        # Alt paned: sürücüler + dosyalar
         explorer_pane = ttk.PanedWindow(parent, orient="vertical")
         explorer_pane.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # Sürücüler / kısayollar
         drv_frame = ttk.Frame(explorer_pane, height=120)
         explorer_pane.add(drv_frame, weight=0)
 
@@ -601,7 +573,6 @@ class DxdViewerApp(tk.Tk):
         self.drv_list.bind("<Double-1>", self.on_drive_activate)
         self.drv_list.bind("<Return>", self.on_drive_activate)
 
-        # Dosyalar
         file_frame = ttk.Frame(explorer_pane)
         explorer_pane.add(file_frame, weight=1)
 
@@ -726,21 +697,17 @@ class DxdViewerApp(tk.Tk):
             self.path_var.set(newdir)
             self.refresh_file_list()
 
-    # -------------------------------------------------
-    # Sol alt kontrol paneli (kanal + trigger + karşılaştırma)
-    # -------------------------------------------------
+    # --- Sol alt: Kontrol paneli ---
     def _build_control_panel(self, parent):
         lf = ttk.LabelFrame(parent, text="DXD Kontrolleri")
         lf.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # Aktif dosya etiketi
         row0 = ttk.Frame(lf)
         row0.pack(fill="x", pady=2)
         ttk.Label(row0, text="Aktif Dosya:").pack(side="left")
         self.ctrl_file_label = ttk.Label(row0, text="(yok)", foreground="#808080")
         self.ctrl_file_label.pack(side="left", padx=5)
 
-        # Kanal seçimi
         row1 = ttk.Frame(lf)
         row1.pack(fill="x", pady=2)
         ttk.Label(row1, text="Kanal:").pack(side="left")
@@ -751,7 +718,6 @@ class DxdViewerApp(tk.Tk):
         self.ctrl_channel_combo.pack(side="left", padx=5, fill="x", expand=True)
         self.ctrl_channel_combo.bind("<<ComboboxSelected>>", self.on_channel_changed)
 
-        # Trigger frame
         trig = ttk.LabelFrame(lf, text="Trigger")
         trig.pack(fill="x", pady=5)
 
@@ -760,18 +726,20 @@ class DxdViewerApp(tk.Tk):
         self.ctrl_pad_var = tk.DoubleVar(value=1.0)
 
         ttk.Label(trig, text="Rising >").grid(row=0, column=0, sticky="w")
-        self.ctrl_rising_entry = ttk.Entry(trig, textvariable=self.ctrl_rising_var, width=7, state="disabled")
+        self.ctrl_rising_entry = ttk.Entry(trig, textvariable=self.ctrl_rising_var,
+                                           width=7, state="disabled")
         self.ctrl_rising_entry.grid(row=0, column=1, padx=2)
 
         ttk.Label(trig, text="Falling <").grid(row=1, column=0, sticky="w")
-        self.ctrl_falling_entry = ttk.Entry(trig, textvariable=self.ctrl_falling_var, width=7, state="disabled")
+        self.ctrl_falling_entry = ttk.Entry(trig, textvariable=self.ctrl_falling_var,
+                                            width=7, state="disabled")
         self.ctrl_falling_entry.grid(row=1, column=1, padx=2)
 
         ttk.Label(trig, text="Pad (s)").grid(row=2, column=0, sticky="w")
-        self.ctrl_pad_entry = ttk.Entry(trig, textvariable=self.ctrl_pad_var, width=7, state="disabled")
+        self.ctrl_pad_entry = ttk.Entry(trig, textvariable=self.ctrl_pad_var,
+                                        width=7, state="disabled")
         self.ctrl_pad_entry.grid(row=2, column=1, padx=2)
 
-        # Butonlar
         row_btn = ttk.Frame(lf)
         row_btn.pack(fill="x", pady=5)
 
@@ -781,7 +749,7 @@ class DxdViewerApp(tk.Tk):
         self.ctrl_apply_btn.pack(side="left", padx=2)
 
         self.ctrl_compare_btn = ttk.Button(
-            row_btn, text="Karşılaştırma Panelini Aç",
+            row_btn, text="Karşılaştırma Paneli",
             command=self.ensure_compare_panel, state="disabled"
         )
         self.ctrl_compare_btn.pack(side="left", padx=2)
@@ -796,7 +764,6 @@ class DxdViewerApp(tk.Tk):
         self.ctrl_compare_btn.configure(state=state)
 
     def set_active_panel(self, panel):
-        # Sadece ViewerPanel için kontrol bağlayalım
         if isinstance(panel, ViewerPanel):
             self.active_panel = panel
             self.ctrl_file_label.configure(
@@ -805,7 +772,7 @@ class DxdViewerApp(tk.Tk):
             )
             channels = panel.get_channels()
             self.ctrl_channel_combo["values"] = channels
-            self.ctrl_channel_var.set("")  # başlangıçta boş, kullanıcı seçecek
+            self.ctrl_channel_var.set("")
             self.set_control_enabled(bool(channels))
         else:
             self.active_panel = None
@@ -828,7 +795,8 @@ class DxdViewerApp(tk.Tk):
             messagebox.showwarning("Trigger", "Trigger değerleri sayısal olmalı.")
             return
 
-        self.active_panel.plot_channel(chan, r, f, p, apply_trigger=True)
+        # Kanal seçilince şimdilik raw veri çiz (trigger yok)
+        self.active_panel.plot_channel(chan, r, f, p, apply_trigger=False)
 
     def on_apply_trigger(self):
         if self.active_panel is None:
@@ -847,25 +815,30 @@ class DxdViewerApp(tk.Tk):
 
         self.active_panel.plot_channel(chan, r, f, p, apply_trigger=True)
 
-    # -------------------------------------------------
-    # Karşılaştırma paneli yönetimi
-    # -------------------------------------------------
+    # --- Compare Panel ---
     def ensure_compare_panel(self):
         if self.compare_panel is None or not self._panel_exists(self.compare_panel):
             self.compare_panel = ComparePanel(self.workspace_canvas, self)
             self._create_panel_window(self.compare_panel, width=800, height=350)
         entry = self._find_panel_entry(self.compare_panel)
-        if entry is not None:
+        if entry:
             self.workspace_canvas.tag_raise(entry["win_id"])
         return self.compare_panel
 
-    # -------------------------------------------------
-    # Panel yönetim yardımcıları
-    # -------------------------------------------------
+    def global_export_csv(self):
+        if self.compare_panel and self._panel_exists(self.compare_panel):
+            self.compare_panel.export_csv()
+        else:
+            messagebox.showwarning(
+                "Export",
+                "Önce karşılaştırma panelini açıp segment eklemelisiniz."
+            )
+
+    # --- panel helper'ları ---
     def _find_panel_entry(self, panel):
-        for entry in self.panels:
-            if entry["panel"] is panel:
-                return entry
+        for e in self.panels:
+            if e["panel"] is panel:
+                return e
         return None
 
     def _panel_exists(self, panel):
@@ -882,11 +855,14 @@ class DxdViewerApp(tk.Tk):
             self.set_active_panel(None)
         panel.destroy()
 
-    # ---- hareket (canvas dışına taşmayı engelle) ----
+    # --- drag & resize (canvas dışına taşmayı engelle, manual ⇒ auto_layout off) ---
     def start_move_panel(self, panel, event):
         entry = self._find_panel_entry(panel)
         if entry is None:
             return
+        if isinstance(panel, ViewerPanel):
+            self.auto_layout = False
+
         self._drag_state = {
             "mode": "move",
             "entry": entry,
@@ -909,7 +885,6 @@ class DxdViewerApp(tk.Tk):
         new_x = self._drag_state["orig_x"] + dx
         new_y = self._drag_state["orig_y"] + dy
 
-        # Canvas sınırında tut
         cw = self.workspace_canvas.winfo_width()
         ch = self.workspace_canvas.winfo_height()
         if cw > 10 and ch > 10:
@@ -926,11 +901,13 @@ class DxdViewerApp(tk.Tk):
         if self._drag_state and self._drag_state.get("mode") == "move":
             self._drag_state = None
 
-    # ---- yeniden boyutlandırma (canvas dışına taşmayı engelle) ----
     def start_resize_panel(self, panel, event):
         entry = self._find_panel_entry(panel)
         if entry is None:
             return
+        if isinstance(panel, ViewerPanel):
+            self.auto_layout = False
+
         self._drag_state = {
             "mode": "resize",
             "entry": entry,
@@ -954,7 +931,6 @@ class DxdViewerApp(tk.Tk):
         new_w = max(400, self._drag_state["orig_w"] + dx)
         new_h = max(250, self._drag_state["orig_h"] + dy)
 
-        # Canvas sınırı
         cw = self.workspace_canvas.winfo_width()
         ch = self.workspace_canvas.winfo_height()
         if cw > 10 and ch > 10:
@@ -965,13 +941,58 @@ class DxdViewerApp(tk.Tk):
 
         entry["w"] = new_w
         entry["h"] = new_h
-
         self.workspace_canvas.itemconfigure(entry["win_id"], width=new_w, height=new_h)
         entry["panel"].configure(width=new_w, height=new_h)
 
     def end_resize_panel(self, panel, event):
         if self._drag_state and self._drag_state.get("mode") == "resize":
             self._drag_state = None
+
+    # --- Organize et: Viewer panellerini grid'e yerleştir ---
+    def organize_panels(self):
+        viewer_entries = [
+            e for e in self.panels if isinstance(e["panel"], ViewerPanel)
+        ]
+        n = len(viewer_entries)
+        if n == 0:
+            return
+
+        self.workspace_canvas.update_idletasks()
+        cw = self.workspace_canvas.winfo_width()
+        ch = self.workspace_canvas.winfo_height()
+        if cw < 50 or ch < 50:
+            return
+
+        if n == 1:
+            rows, cols = 1, 1
+        elif n == 2:
+            rows, cols = 2, 1
+        else:
+            cols = math.ceil(math.sqrt(n))
+            rows = math.ceil(n / cols)
+
+        cell_w = cw / cols
+        cell_h = ch / rows
+        margin = 4
+
+        for idx, entry in enumerate(viewer_entries):
+            r = idx // cols
+            c = idx % cols
+            x = int(c * cell_w) + margin // 2
+            y = int(r * cell_h) + margin // 2
+            w = max(200, int(cell_w) - margin)
+            h = max(150, int(cell_h) - margin)
+
+            entry["x"] = x
+            entry["y"] = y
+            entry["w"] = w
+            entry["h"] = h
+
+            self.workspace_canvas.coords(entry["win_id"], x, y)
+            self.workspace_canvas.itemconfigure(entry["win_id"], width=w, height=h)
+            entry["panel"].configure(width=w, height=h)
+
+        self.auto_layout = True
 
 
 # =========================================================
